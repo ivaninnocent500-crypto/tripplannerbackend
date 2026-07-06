@@ -1,0 +1,20 @@
+{
+  "name": "africa-safari-guide-backend",
+  "version": "1.0.0",
+  "description": "Minimal honest-inquiry backend for Africa Safari Guide. Receives inquiry submissions from the Android app, stores them, and is the correct place to add Stripe payments later.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express-rate-limit": "^7.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

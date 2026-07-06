@@ -1,0 +1,46 @@
+[
+  {
+    "id": "id_1",
+    "name": "Serengeti Elite Ltd",
+    "rating": 4.9,
+    "reviews": 324,
+    "basePrice": 3750,
+    "countries": ["Tanzania"],
+    "vehicleType": "Custom Land Cruiser",
+    "allInclusive": true,
+    "airportTransfer": "Private"
+  },
+  {
+    "id": "id_2",
+    "name": "Nomad Kenya",
+    "rating": 4.8,
+    "reviews": 156,
+    "basePrice": 4100,
+    "countries": ["Kenya"],
+    "vehicleType": "Standard 4x4",
+    "allInclusive": false,
+    "airportTransfer": "Shared"
+  },
+  {
+    "id": "id_3",
+    "name": "Great Rift Safaris",
+    "rating": 4.7,
+    "reviews": 89,
+    "basePrice": 2900,
+    "countries": ["Tanzania", "Kenya"],
+    "vehicleType": "Standard 4x4",
+    "allInclusive": false,
+    "airportTransfer": "Shared"
+  },
+  {
+    "id": "id_4",
+    "name": "Okavango Horizons",
+    "rating": 4.85,
+    "reviews": 211,
+    "basePrice": 5200,
+    "countries": ["Botswana"],
+    "vehicleType": "Open-Sided 4x4",
+    "allInclusive": true,
+    "airportTransfer": "Private"
+  }
+]

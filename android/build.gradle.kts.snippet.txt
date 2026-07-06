@@ -1,0 +1,31 @@
+// Add this to app/build.gradle.kts inside the android { } block.
+// This injects GEMINI_API_KEY from local.properties into BuildConfig at
+// compile time, so the key never appears as a literal string in any .kt file.
+
+import java.util.Properties
+import java.io.FileInputStream
+
+android {
+    // ... your existing android { } contents stay exactly as they are ...
+
+    val localProperties = Properties()
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localProperties.load(FileInputStream(localPropertiesFile))
+    }
+
+    defaultConfig {
+        // ... your existing defaultConfig contents stay exactly as they are ...
+
+        buildConfigField(
+            "String",
+            "GEMINI_API_KEY",
+            "\"${localProperties.getProperty("GEMINI_API_KEY", "")}\""
+        )
+    }
+
+    buildFeatures {
+        buildConfig = true
+        // ... your existing buildFeatures contents stay exactly as they are ...
+    }
+}

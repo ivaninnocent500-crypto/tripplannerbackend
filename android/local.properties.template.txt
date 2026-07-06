@@ -1,0 +1,12 @@
+# local.properties TEMPLATE — copy the GEMINI_API_KEY line into your real
+# local.properties file (which already has sdk.dir set correctly).
+#
+# IMPORTANT: Generate a NEW Gemini API key before using this. The key that
+# was previously in this file (AIzaSyBCsSTqybuOe61NwU0wpmKmUSzU4I_FvBs) was
+# exposed multiple times in screenshots and pasted code during development
+# and must be treated as compromised. Revoke it at
+# https://aistudio.google.com/app/apikey and generate a new one.
+#
+# No quotes around the value.
+
+GEMINI_API_KEY=paste_your_new_key_here
