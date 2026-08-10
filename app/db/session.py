@@ -8,27 +8,6 @@ GenerationLog is written via legacy_db and never supabase_db).
                            (travel_places, wildlife, lodges, etc.)
     get_legacy_db() -> the original ati-production DB, used ONLY
                            for GenerationLog (operational/audit data)
-
-PORT 6543 vs 5432
-------------------
-Supabase exposes Postgres two ways:
-  - port 5432 = direct connection (session mode). Fine for long-lived
-    servers that keep a small persistent pool, but each connection holds
-    a real Postgres backend process open.
-  - port 6543 = PgBouncer transaction-mode pooler. Required if you expect
-    many short-lived connections (e.g. serverless/autoscaling), but it
-    does NOT support session-level features some drivers assume
-    (prepared statement caching in particular) — hence NullPool below
-    when pooled mode is detected.
-
-Your .env.example currently has port 5432 in SUPABASE_DATABASE_URL. This
-module does NOT silently rewrite that port for you — guessing wrong here
-causes real, confusing connection failures (exactly what the .env.example
-comment warns about). Instead it detects which mode you configured from
-the URL itself and picks the matching SQLAlchemy pool class, so whichever
-port you correctly set will work without code changes. Confirm with
-Supabase's dashboard (Project Settings -> Database -> Connection string)
-which port your project actually expects before deploying.
 """
 from __future__ import annotations
 
@@ -61,7 +40,6 @@ def _build_supabase_engine() -> Engine:
         logger.error("❌ SUPABASE_DATABASE_URL environment variable is missing.")
         raise DatabaseNotConfiguredError("SUPABASE_DATABASE_URL is not set.")
 
-    # Remove accidental surrounding quotes or trailing spaces
     url = url.strip("'\" ")
 
     is_pooled = ":6543" in url
@@ -74,7 +52,7 @@ def _build_supabase_engine() -> Engine:
     try:
         return create_engine(url, poolclass=pool_class, **kwargs)
     except Exception as exc:
-        logger.error("❌ Failed to create Supabase engine for URL '%s...': %s", url[:20], exc, exc_info=True)
+        logger.error("❌ Failed to create Supabase engine: %s", exc, exc_info=True)
         raise
 
 
@@ -89,8 +67,66 @@ def _build_legacy_engine() -> Engine:
     try:
         return create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10, pool_recycle=1800)
     except Exception as exc:
-        logger.error("❌ Failed to create Legacy engine for URL '%s...': %s", url[:20], exc, exc_info=True)
+        logger.error("❌ Failed to create Legacy engine: %s", exc, exc_info=True)
         raise
+
+
+def _get_supabase_sessionmaker() -> sessionmaker:
+    global _supabase_engine, _SupabaseSession
+    if _SupabaseSession is None:
+        _supabase_engine = _build_supabase_engine()
+        _SupabaseSession = sessionmaker(bind=_supabase_engine, autoflush=False, autocommit=False)
+    return _SupabaseSession
+
+
+def _get_legacy_sessionmaker() -> sessionmaker:
+    global _legacy_engine, _LegacySession
+    if _LegacySession is None:
+        _legacy_engine = _build_legacy_engine()
+        _LegacySession = sessionmaker(bind=_legacy_engine, autoflush=False, autocommit=False)
+    return _LegacySession
+
+
+def get_supabase_db() -> Iterator[Session]:
+    """FastAPI dependency: yields a Supabase session."""
+    SessionLocal = _get_supabase_sessionmaker()
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_legacy_db() -> Iterator[Session]:
+    """FastAPI dependency: yields a legacy DB session."""
+    SessionLocal = _get_legacy_sessionmaker()
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def supabase_session() -> Iterator[Session]:
+    """Context manager for health checks and standalone scripts."""
+    SessionLocal = _get_supabase_sessionmaker()
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def legacy_session() -> Iterator[Session]:
+    """Context manager for health checks and standalone scripts."""
+    SessionLocal = _get_legacy_sessionmaker()
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def check_supabase_connection() -> bool:
