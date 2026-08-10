@@ -32,6 +32,7 @@ which port your project actually expects before deploying.
 """
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import contextmanager
 from typing import Iterator
@@ -40,6 +41,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseNotConfiguredError(RuntimeError):
@@ -79,10 +82,10 @@ def _build_supabase_engine() -> Engine:
 
 
 def _build_legacy_engine() -> Engine:
-    url = os.environ.get("DATABASE_URL")
+    url = os.environ.get("DATABASE_URL") or os.environ.get("LEGACY_DATABASE_URL")
     if not url:
         raise DatabaseNotConfiguredError(
-            "DATABASE_URL is not set. This is required for GenerationLog "
+            "DATABASE_URL or LEGACY_DATABASE_URL is not set. This is required for GenerationLog "
             "persistence (operational/audit data) — see .env.example."
         )
     return create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10, pool_recycle=1800)
@@ -151,7 +154,8 @@ def check_supabase_connection() -> bool:
         with supabase_session() as db:
             db.execute(text("SELECT 1"))
         return True
-    except Exception:
+    except Exception as exc:
+        logger.error("❌ Supabase DB Connection Error: %s", exc, exc_info=True)
         return False
 
 
@@ -161,6 +165,7 @@ def check_legacy_connection() -> bool:
         with legacy_session() as db:
             db.execute(text("SELECT 1"))
         return True
-    except Exception:
+    except Exception as exc:
+        logger.error("❌ Legacy DB Connection Error: %s", exc, exc_info=True)
         return False
 
