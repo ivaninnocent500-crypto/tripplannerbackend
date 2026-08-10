@@ -30,6 +30,7 @@ Endpoints intentionally NOT included (see schemas.py for why):
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -47,17 +48,16 @@ from app.api.schemas import (
 )
 from app.core.orchestrator import TripOrchestrator
 from app.db.session import (
+    DatabaseNotConfiguredError,
     check_legacy_connection,
     check_supabase_connection,
     get_legacy_db,
     get_supabase_db,
 )
-from app.db.session import DatabaseNotConfiguredError
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["trip"])
-
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -67,16 +67,35 @@ def health_check() -> HealthResponse:
     uptime monitors need to hit this without a key. It reports connection
     status but never leaks connection strings or credentials.
     """
-    import os
+    supabase_ok = False
+    legacy_ok = False
 
-    supabase_ok = check_supabase_connection()
-    legacy_ok = check_legacy_connection()
+    # Check Supabase Database Connection
+    try:
+        supabase_ok = check_supabase_connection()
+        if not supabase_ok:
+            logger.error("❌ Health Check: check_supabase_connection() returned False.")
+    except Exception as exc:
+        logger.exception("❌ Health Check - Supabase Connection Exception: %s", exc)
+
+    # Check Legacy Database Connection
+    try:
+        legacy_ok = check_legacy_connection()
+        if not legacy_ok:
+            logger.error("❌ Health Check: check_legacy_connection() returned False.")
+    except Exception as exc:
+        logger.exception("❌ Health Check - Legacy DB Connection Exception: %s", exc)
+
+    # Check AI Gateway Environment Flag
+    ai_enabled = os.environ.get("ATI_AI_ENABLED", "false").lower() == "true"
+    if not ai_enabled:
+        logger.info("ℹ️ Health Check: ATI_AI_ENABLED is set to False or not configured.")
 
     return HealthResponse(
         status="ok" if (supabase_ok and legacy_ok) else "degraded",
         supabase_connected=supabase_ok,
         legacy_db_connected=legacy_ok,
-        ai_gateway_enabled=os.environ.get("ATI_AI_ENABLED", "false").lower() == "true",
+        ai_gateway_enabled=ai_enabled,
     )
 
 
