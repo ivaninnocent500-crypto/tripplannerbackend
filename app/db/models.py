@@ -2,8 +2,10 @@
 Legacy operational database models (audit logs and generation meta).
 """
 from sqlalchemy import Column, Integer, JSON, String, Boolean, DateTime
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
-from app.db.session import Base # Or declarative_base() if Base isn't in session.py
+
+Base = declarative_base()
 
 
 class GenerationLog(Base):
