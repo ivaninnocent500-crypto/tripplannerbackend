@@ -1,109 +1,123 @@
 """
-Database session management — TWO connections during the migration
-period, per the decision flagged in orchestrator.py:
+Two independent SQLAlchemy engines/sessions, matching TripOrchestrator's
+two-session design (see app/core/orchestrator.py's docstring and
+tests/test_two_database_wiring.py, which specifically asserts
+GenerationLog is written via legacy_db and never supabase_db).
 
-  1. LEGACY_DATABASE_URL: the original ati-production database
-     (GenerationLog only — operational/audit data, not travel knowledge).
-     This is your EXISTING Render Postgres/SQLite, unchanged.
+    get_supabase_db() -> the Travel Intelligence knowledge base
+                           (travel_places, wildlife, lodges, etc.)
+    get_legacy_db() -> the original ati-production DB, used ONLY
+                           for GenerationLog (operational/audit data)
 
-  2. SUPABASE_DATABASE_URL: the new Travel Intelligence knowledge base
-     (travel_places, lodges, wildlife, tour_operators, etc.) — this is
-     what every engine now queries.
+PORT 6543 vs 5432
+------------------
+Supabase exposes Postgres two ways:
+  - port 5432 = direct connection (session mode). Fine for long-lived
+    servers that keep a small persistent pool, but each connection holds
+    a real Postgres backend process open.
+  - port 6543 = PgBouncer transaction-mode pooler. Required if you expect
+    many short-lived connections (e.g. serverless/autoscaling), but it
+    does NOT support session-level features some drivers assume
+    (prepared statement caching in particular) — hence NullPool below
+    when pooled mode is detected.
 
-⚠️ SUPABASE_DATABASE_URL IS STILL A PLACEHOLDER. You said the connection
-string is pending. get_supabase_db() below will raise a clear
-RuntimeError (not a silent failure or a guessed default) until you set
-SUPABASE_DATABASE_URL. This is intentional — better to fail loudly at
-startup than to silently connect to the wrong database or crash deep
-inside an engine query with a confusing error.
-
-WHEN YOU HAVE THE CONNECTION STRING: Supabase's connection pooler
-(PgBouncer, typically port 6543) requires NullPool in SQLAlchemy —
-transaction-mode pooling doesn't support the persistent connections
-SQLAlchemy's default pool assumes. Port 5432 (direct connection, not
-pooled) works with SQLAlchemy's normal pooling. Use whichever your
-Supabase project's connection string uses; if unsure, port 6543 +
-NullPool is the safer default for a serverless-style deployment like
-Render. This is set up below but commented, since guessing wrong here
-causes real connection failures — confirm which port your string uses
-before uncommenting.
-
-Once you have the real connection string: set SUPABASE_DATABASE_URL as a
-Render environment variable, same as GEMINI_API_KEY and ATI_API_KEY were
-added earlier in this project — never commit it to any file.
+Your .env.example currently has port 5432 in SUPABASE_DATABASE_URL. This
+module does NOT silently rewrite that port for you — guessing wrong here
+causes real, confusing connection failures (exactly what the .env.example
+comment warns about). Instead it detects which mode you configured from
+the URL itself and picks the matching SQLAlchemy pool class, so whichever
+port you correctly set will work without code changes. Confirm with
+Supabase's dashboard (Project Settings -> Database -> Connection string)
+which port your project actually expects before deploying.
 """
 from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Generator
+from typing import Iterator
 
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.pool import NullPool
-
-# ---- Legacy DB (GenerationLog only) — unchanged from before migration ----
-LEGACY_DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./ati_dev.db")
-_legacy_connect_args = {"check_same_thread": False} if LEGACY_DATABASE_URL.startswith("sqlite") else {}
-legacy_engine = create_engine(LEGACY_DATABASE_URL, connect_args=_legacy_connect_args, pool_pre_ping=True)
-LegacySessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=legacy_engine)
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool, QueuePool
 
 
-def get_db() -> Generator[Session, None, None]:
-    """Existing dependency name, unchanged — still points at the legacy
-    DB, since GenerationLog is the only thing still living there."""
-    db = LegacySessionLocal()
+class DatabaseNotConfiguredError(RuntimeError):
+    """Raised when a required *_DATABASE_URL env var is missing at request time."""
+
+
+_supabase_engine: Engine | None = None
+_legacy_engine: Engine | None = None
+_SupabaseSession: sessionmaker | None = None
+_LegacySession: sessionmaker | None = None
+
+
+def _build_supabase_engine() -> Engine:
+    url = os.environ.get("SUPABASE_DATABASE_URL")
+    if not url:
+        raise DatabaseNotConfiguredError(
+            "SUPABASE_DATABASE_URL is not set. Every travel-data engine "
+            "(ItineraryEngine, BudgetEngine, OperatorEngine, WeatherEngine, "
+            "WildlifeEngine, RoutingEngine, PackingEngine) requires this to "
+            "query the Travel Intelligence knowledge base. Set it in your "
+            "environment / Render dashboard — see .env.example."
+        )
+
+    # Port 6543 = PgBouncer transaction pooler -> use NullPool, since
+    # SQLAlchemy's own connection pooling on top of an external pooler
+    # causes prepared-statement / session-state bugs. Port 5432 (or
+    # anything else) = direct connection -> a normal bounded QueuePool
+    # is appropriate and more efficient for a single long-lived server.
+    is_pooled = ":6543" in url
+    pool_class = NullPool if is_pooled else QueuePool
+
+    kwargs: dict = {"pool_pre_ping": True}
+    if pool_class is QueuePool:
+        kwargs.update(pool_size=5, max_overflow=10, pool_recycle=1800)
+
+    return create_engine(url, poolclass=pool_class, **kwargs)
+
+
+def _build_legacy_engine() -> Engine:
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise DatabaseNotConfiguredError(
+            "DATABASE_URL is not set. This is required for GenerationLog "
+            "persistence (operational/audit data) — see .env.example."
+        )
+    return create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10, pool_recycle=1800)
+
+
+def _get_supabase_sessionmaker() -> sessionmaker:
+    global _supabase_engine, _SupabaseSession
+    if _SupabaseSession is None:
+        _supabase_engine = _build_supabase_engine()
+        _SupabaseSession = sessionmaker(bind=_supabase_engine, autoflush=False, autocommit=False)
+    return _SupabaseSession
+
+
+def _get_legacy_sessionmaker() -> sessionmaker:
+    global _legacy_engine, _LegacySession
+    if _LegacySession is None:
+        _legacy_engine = _build_legacy_engine()
+        _LegacySession = sessionmaker(bind=_legacy_engine, autoflush=False, autocommit=False)
+    return _LegacySession
+
+
+def get_supabase_db() -> Iterator[Session]:
+    """FastAPI dependency: yields a Supabase Travel Intelligence session, closes it after the request."""
+    SessionLocal = _get_supabase_sessionmaker()
+    db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
 
-# ---- Supabase Travel Intelligence DB — PENDING connection string ----
-SUPABASE_DATABASE_URL = os.environ.get("SUPABASE_DATABASE_URL", "")
-
-_supabase_engine = None
-SupabaseSessionLocal = None
-
-if SUPABASE_DATABASE_URL:
-    # Uncomment and choose ONE of these once you confirm your Supabase
-    # connection string's port/pooling mode:
-    #
-    # Option A — pooled connection (port 6543, PgBouncer transaction mode):
-    # _supabase_engine = create_engine(SUPABASE_DATABASE_URL, poolclass=NullPool)
-    #
-    # Option B — direct connection (port 5432, no pooler):
-    # _supabase_engine = create_engine(SUPABASE_DATABASE_URL, pool_pre_ping=True)
-    #
-    # Defaulting to Option A (NullPool) as the safer choice for a
-    # serverless-style host like Render, per the docstring above — change
-    # to Option B if your string is the direct (5432) connection.
-    _supabase_engine = create_engine(SUPABASE_DATABASE_URL, poolclass=NullPool)
-    SupabaseSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_supabase_engine)
-
-
-def get_supabase_db() -> Generator[Session, None, None]:
-    """
-    FastAPI dependency for the new Travel Intelligence knowledge base.
-    Every engine (ItineraryEngine, WildlifeEngine, OperatorEngine,
-    RoutingEngine, BudgetEngine, PackingEngine, WeatherEngine) should
-    receive a session from THIS function, not get_db(), once wired into
-    the API layer.
-
-    Raises RuntimeError with a clear message if SUPABASE_DATABASE_URL
-    isn't set — this is deliberate: failing loudly at request time (or
-    ideally at app startup, see main.py) is far better than a confusing
-    downstream error inside an engine's first query.
-    """
-    if SupabaseSessionLocal is None:
-        raise RuntimeError(
-            "SUPABASE_DATABASE_URL is not configured. Set it as an "
-            "environment variable (Render: Environment tab) once your "
-            "Supabase connection string is ready. See session.py's "
-            "docstring for pooling-mode guidance (port 6543 + NullPool "
-            "vs port 5432 direct)."
-        )
-    db = SupabaseSessionLocal()
+def get_legacy_db() -> Iterator[Session]:
+    """FastAPI dependency: yields a legacy ati-production session, closes it after the request."""
+    SessionLocal = _get_legacy_sessionmaker()
+    db = SessionLocal()
     try:
         yield db
     finally:
@@ -111,18 +125,42 @@ def get_supabase_db() -> Generator[Session, None, None]:
 
 
 @contextmanager
-def supabase_db_session() -> Generator[Session, None, None]:
-    """Context-manager version for scripts (e.g. a future seed script
-    for the Supabase knowledge base), mirroring the legacy db_session()
-    pattern already used by seed_initial_data.py."""
-    if SupabaseSessionLocal is None:
-        raise RuntimeError("SUPABASE_DATABASE_URL is not configured. See get_supabase_db().")
-    db = SupabaseSessionLocal()
+def supabase_session() -> Iterator[Session]:
+    """Non-FastAPI context-manager form, for scripts/health checks."""
+    SessionLocal = _get_supabase_sessionmaker()
+    db = SessionLocal()
     try:
         yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
     finally:
         db.close()
+
+
+@contextmanager
+def legacy_session() -> Iterator[Session]:
+    SessionLocal = _get_legacy_sessionmaker()
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def check_supabase_connection() -> bool:
+    try:
+        from sqlalchemy import text
+        with supabase_session() as db:
+            db.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+
+
+def check_legacy_connection() -> bool:
+    try:
+        from sqlalchemy import text
+        with legacy_session() as db:
+            db.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+
