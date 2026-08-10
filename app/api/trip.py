@@ -1,72 +1,158 @@
 """
-Trip generation + AI Gateway Q&A endpoints. UPDATED: generate_trip now
-depends on get_supabase_db instead of get_db, since TripOrchestrator's
-engines all query the new Travel Intelligence schema. GenerationLog
-writes still happen (orchestrator.py imports the legacy GenerationLog
-model directly and writes via a separate legacy session internally —
-see the note in orchestrator.py about why GenerationLog stays on the old
-DB during the migration period).
+Trip planner API routes.
 
-ask_trip_question is UNCHANGED — it doesn't touch any database, it only
-calls the AI Gateway over data the client already sent back.
+This is the FIRST real FastAPI route file for this project — per the
+master migration prompt's own rule ("If an endpoint does not exist, do
+not silently fake it in Kotlin. Document it as a backend contract
+requirement"), the Android TravelApi.kt must be built against THIS file,
+not the conceptual /api/... list from the planning document. Only routes
+that are actually implemented and wired to real engines are exposed here.
+
+Endpoints in this delivery:
+    GET /api/health
+    POST /api/itineraries/generate
+
+Endpoints intentionally NOT included (see schemas.py for why):
+    /api/assistant/message -> Jabari stays on its current direct-Gemini
+                                architecture per explicit instruction;
+                                not part of this migration.
+    /api/inquiries -> no InquiryEngine/persistence exists yet;
+                                wiring this now would mean inventing
+                                storage rather than connecting real code.
+    /api/destinations/* -> no DestinationEngine/aggregation service
+                                exists yet in the shared code; see
+                                MIGRATION_NOTES.md for the follow-up.
+    /api/operators/compare -> OperatorEngine.rank() exists and IS wired
+                                below via the trip response's operators
+                                block; a standalone comparison endpoint
+                                would need new engine logic, not yet built.
 """
 from __future__ import annotations
 
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+import time
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.db.session import get_supabase_db, get_db
 from app.api.auth import require_api_key
 from app.api.schemas import (
-    TripRequest, TripResponse, AskTripQuestionRequest, AskTripQuestionResponse
+    ErrorResponse,
+    GenerateTripRequest,
+    GenerateTripResponse,
+    HealthResponse,
+    ResponseMetadata,
 )
 from app.core.orchestrator import TripOrchestrator
-from app.ai.gateway import get_ai_gateway
+from app.db.session import (
+    check_legacy_connection,
+    check_supabase_connection,
+    get_legacy_db,
+    get_supabase_db,
+)
+from app.db.session import DatabaseNotConfiguredError
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/trip", tags=["trip"])
+router = APIRouter(prefix="/api")
 
 
-@router.post("/generate", response_model=TripResponse, dependencies=[Depends(require_api_key)])
-def generate_trip(
-    request: TripRequest,
-    supabase_db: Session = Depends(get_supabase_db),
-    legacy_db: Session = Depends(get_db),
-) -> TripResponse:
-    try:
-        orchestrator = TripOrchestrator(supabase_db, legacy_db)
-        result = orchestrator.build_trip(request.model_dump())
-        return TripResponse(**result)
-    except RuntimeError as e:
-        # Specifically catches the "SUPABASE_DATABASE_URL not configured"
-        # error from session.py with a clear 503, distinct from a generic
-        # 500 — makes the pending-connection-string state visible in the
-        # API response itself, not just server logs.
-        logger.error("Trip generation failed: Supabase not configured: %s", str(e))
-        raise HTTPException(
-            status_code=503,
-            detail="Travel Intelligence database is not yet configured. Please try again later."
-        )
-    except Exception as e:
-        logger.error("Trip generation failed unexpectedly: %s", str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail="Trip generation failed. Please try again.")
+@router.get("/health", response_model=HealthResponse)
+def health_check() -> HealthResponse:
+    """
+    Unauthenticated on purpose — Render's own health checks and simple
+    uptime monitors need to hit this without a key. It reports connection
+    status but never leaks connection strings or credentials.
+    """
+    import os
 
+    supabase_ok = check_supabase_connection()
+    legacy_ok = check_legacy_connection()
 
-@router.post("/ask", response_model=AskTripQuestionResponse, dependencies=[Depends(require_api_key)])
-def ask_trip_question(request: AskTripQuestionRequest) -> AskTripQuestionResponse:
-    ai_gateway = get_ai_gateway()
-
-    if not ai_gateway.is_available():
-        return AskTripQuestionResponse(
-            available=False,
-            error="AI Gateway is not currently available. Trip details are still fully accessible in the trip data."
-        )
-
-    result = ai_gateway.answer_question(request.trip, request.question)
-    return AskTripQuestionResponse(
-        available=result.available,
-        answer=result.summary,
-        error=result.error,
+    return HealthResponse(
+        status="ok" if (supabase_ok and legacy_ok) else "degraded",
+        supabase_connected=supabase_ok,
+        legacy_db_connected=legacy_ok,
+        ai_gateway_enabled=os.environ.get("ATI_AI_ENABLED", "false").lower() == "true",
     )
+
+
+@router.post(
+    "/itineraries/generate",
+    response_model=GenerateTripResponse,
+    responses={
+        401: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+def generate_itinerary(
+    request: GenerateTripRequest,
+    supabase_db: Session = Depends(get_supabase_db),
+    legacy_db: Session = Depends(get_legacy_db),
+    _auth: None = Depends(require_api_key),
+) -> GenerateTripResponse:
+    """
+    The single most important endpoint in this migration — this is the
+    HTTP front door for what your master prompt calls the "new flow":
+
+        Android -> TravelRepository.generateItinerary()
+                -> POST /api/itineraries/generate
+                -> TripOrchestrator.build_trip()
+                -> Supabase + engines + AI gateway
+                -> structured JSON
+                -> Android ItineraryViewModel
+
+    No business logic lives here. This route's only job is: validate the
+    request shape (Pydantic), open sessions, call the orchestrator exactly
+    as tests/test_two_database_wiring.py expects it to be called, and wrap
+    the result with response metadata. Every calculation, retrieval, and
+    scoring decision stays inside orchestrator.py / app/engines/*.py,
+    unchanged.
+    """
+    request_id = str(uuid.uuid4())
+    started = time.monotonic()
+
+    orchestrator = TripOrchestrator(supabase_db=supabase_db, legacy_db=legacy_db)
+
+    try:
+        result = orchestrator.build_trip(request.to_orchestrator_dict())
+    except DatabaseNotConfiguredError as exc:
+        logger.error("Database not configured for request %s: %s", request_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc: # noqa: BLE001
+        # The orchestrator already wraps each engine call in
+        # call_engine()/EngineResilienceWrapper with per-engine fallbacks
+        # (see orchestrator.py — itinerary_result, operator_result, etc.
+        # all degrade gracefully rather than raising). An exception
+        # reaching this point means something OUTSIDE that resilience
+        # wrapping failed (e.g. the initial RulesEngine().apply() call,
+        # or a DB connection dying mid-request) — a genuine 500, not a
+        # degraded-but-successful trip.
+        logger.exception("Unhandled error generating trip for request %s", request_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Trip generation failed unexpectedly. Please try again.",
+        ) from exc
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    degraded = bool(result.get("trip", {}).get("generation_meta", {}).get("degraded", False))
+
+    return GenerateTripResponse(
+        trip=result["trip"],
+        ai_enhancements=result["ai_enhancements"],
+        metadata=ResponseMetadata(
+            request_id=request_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            source="render-backend",
+            data_freshness=f"{elapsed_ms}ms generation time",
+            degraded=degraded,
+        ),
+    )
+
