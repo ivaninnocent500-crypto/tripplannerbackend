@@ -58,19 +58,12 @@ _LegacySession: sessionmaker | None = None
 def _build_supabase_engine() -> Engine:
     url = os.environ.get("SUPABASE_DATABASE_URL")
     if not url:
-        raise DatabaseNotConfiguredError(
-            "SUPABASE_DATABASE_URL is not set. Every travel-data engine "
-            "(ItineraryEngine, BudgetEngine, OperatorEngine, WeatherEngine, "
-            "WildlifeEngine, RoutingEngine, PackingEngine) requires this to "
-            "query the Travel Intelligence knowledge base. Set it in your "
-            "environment / Render dashboard — see .env.example."
-        )
+        logger.error("❌ SUPABASE_DATABASE_URL environment variable is missing.")
+        raise DatabaseNotConfiguredError("SUPABASE_DATABASE_URL is not set.")
 
-    # Port 6543 = PgBouncer transaction pooler -> use NullPool, since
-    # SQLAlchemy's own connection pooling on top of an external pooler
-    # causes prepared-statement / session-state bugs. Port 5432 (or
-    # anything else) = direct connection -> a normal bounded QueuePool
-    # is appropriate and more efficient for a single long-lived server.
+    # Remove accidental surrounding quotes or trailing spaces
+    url = url.strip("'\" ")
+
     is_pooled = ":6543" in url
     pool_class = NullPool if is_pooled else QueuePool
 
@@ -78,74 +71,26 @@ def _build_supabase_engine() -> Engine:
     if pool_class is QueuePool:
         kwargs.update(pool_size=5, max_overflow=10, pool_recycle=1800)
 
-    return create_engine(url, poolclass=pool_class, **kwargs)
+    try:
+        return create_engine(url, poolclass=pool_class, **kwargs)
+    except Exception as exc:
+        logger.error("❌ Failed to create Supabase engine for URL '%s...': %s", url[:20], exc, exc_info=True)
+        raise
 
 
 def _build_legacy_engine() -> Engine:
     url = os.environ.get("DATABASE_URL") or os.environ.get("LEGACY_DATABASE_URL")
     if not url:
-        raise DatabaseNotConfiguredError(
-            "DATABASE_URL or LEGACY_DATABASE_URL is not set. This is required for GenerationLog "
-            "persistence (operational/audit data) — see .env.example."
-        )
-    return create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10, pool_recycle=1800)
+        logger.error("❌ DATABASE_URL / LEGACY_DATABASE_URL environment variable is missing.")
+        raise DatabaseNotConfiguredError("DATABASE_URL is not set.")
 
+    url = url.strip("'\" ")
 
-def _get_supabase_sessionmaker() -> sessionmaker:
-    global _supabase_engine, _SupabaseSession
-    if _SupabaseSession is None:
-        _supabase_engine = _build_supabase_engine()
-        _SupabaseSession = sessionmaker(bind=_supabase_engine, autoflush=False, autocommit=False)
-    return _SupabaseSession
-
-
-def _get_legacy_sessionmaker() -> sessionmaker:
-    global _legacy_engine, _LegacySession
-    if _LegacySession is None:
-        _legacy_engine = _build_legacy_engine()
-        _LegacySession = sessionmaker(bind=_legacy_engine, autoflush=False, autocommit=False)
-    return _LegacySession
-
-
-def get_supabase_db() -> Iterator[Session]:
-    """FastAPI dependency: yields a Supabase Travel Intelligence session, closes it after the request."""
-    SessionLocal = _get_supabase_sessionmaker()
-    db = SessionLocal()
     try:
-        yield db
-    finally:
-        db.close()
-
-
-def get_legacy_db() -> Iterator[Session]:
-    """FastAPI dependency: yields a legacy ati-production session, closes it after the request."""
-    SessionLocal = _get_legacy_sessionmaker()
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-@contextmanager
-def supabase_session() -> Iterator[Session]:
-    """Non-FastAPI context-manager form, for scripts/health checks."""
-    SessionLocal = _get_supabase_sessionmaker()
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-@contextmanager
-def legacy_session() -> Iterator[Session]:
-    SessionLocal = _get_legacy_sessionmaker()
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+        return create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10, pool_recycle=1800)
+    except Exception as exc:
+        logger.error("❌ Failed to create Legacy engine for URL '%s...': %s", url[:20], exc, exc_info=True)
+        raise
 
 
 def check_supabase_connection() -> bool:
@@ -155,7 +100,7 @@ def check_supabase_connection() -> bool:
             db.execute(text("SELECT 1"))
         return True
     except Exception as exc:
-        logger.error("❌ Supabase DB Connection Error: %s", exc, exc_info=True)
+        logger.error("❌ Supabase connection failed: %s", exc, exc_info=True)
         return False
 
 
@@ -166,6 +111,6 @@ def check_legacy_connection() -> bool:
             db.execute(text("SELECT 1"))
         return True
     except Exception as exc:
-        logger.error("❌ Legacy DB Connection Error: %s", exc, exc_info=True)
+        logger.error("❌ Legacy DB connection failed: %s", exc, exc_info=True)
         return False
 
