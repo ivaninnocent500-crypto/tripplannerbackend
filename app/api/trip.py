@@ -56,7 +56,8 @@ from app.db.session import DatabaseNotConfiguredError
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api")
+router = APIRouter(tags=["trip"])
+
 
 
 @router.get("/health", response_model=HealthResponse)
