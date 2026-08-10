@@ -43,7 +43,7 @@ app.add_middleware(
     allow_headers=["X-Api-Key", "Content-Type"],
 )
 
-app.include_router(trip_router)
+app.include_router(trip_router, prefix="/api")
 
 
 @app.exception_handler(Exception)
