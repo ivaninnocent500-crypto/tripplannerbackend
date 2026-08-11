@@ -534,56 +534,28 @@ class TripOrchestrator:
         # GENERATION LOG
         # ================================================================
 
-        log_entry = GenerationLog(
-            request_json=request,
-
-            matched_destination_ids=list(
-                known
-            ),
-
-            unmatched_terms=unmatched,
-
-            confidence_score=(
-                confidence_result.value.score
-                if confidence_result.value
-                else None
-            ),
-
-            total_generation_time_ms=(
-                elapsed_ms
-                + ai_gateway_elapsed_ms
-            ),
-
-            ai_gateway_used=ai_result.available,
-
-            error_message=(
-                "; ".join(
-                    filter(
-                        None,
-                        [
-                            itinerary_result.error,
-                            operator_result.error,
-                            packing_result.error,
-                            budget_result.error,
-                            weather_forecast_result.error,
-                            wildlife_result.error,
-                            routing_result.error,
-                            confidence_result.error,
-                            insights_result.error,
-                            (
-                                ai_result.error
-                                if not ai_result.available
-                                else None
-                            ),
-                        ],
-                    )
-                )
-                or None
-            ),
-        )
-
-        self.legacy_db.add(log_entry)
-        self.legacy_db.commit()
+        try:
+            log_entry = GenerationLog(
+                request_json=request,
+                matched_destination_ids=list(known),
+                unmatched_terms=unmatched,
+                confidence_score=confidence_result.value.score if confidence_result.value else None,
+                total_generation_time_ms=elapsed_ms + ai_gateway_elapsed_ms,
+                ai_gateway_used=ai_result.available,
+                error_message=(
+                    "; ".join(filter(None, [
+                        itinerary_result.error, operator_result.error, packing_result.error,
+                        budget_result.error, weather_forecast_result.error, wildlife_result.error,
+                        routing_result.error, confidence_result.error, insights_result.error,
+                        ai_result.error if not ai_result.available else None,
+                    ])) or None
+                ),
+            )
+            self.legacy_db.add(log_entry)
+            self.legacy_db.commit()
+        except Exception as log_err:
+            self.legacy_db.rollback()
+            logger.error("Failed to write GenerationLog: %s", log_err)
 
         # ================================================================
         # FINAL RESPONSE
