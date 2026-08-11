@@ -50,7 +50,16 @@ class TripOrchestrator:
     def build_trip(self, request: dict[str, Any]) -> dict[str, Any]:
         start_time = time.monotonic()
 
-        request = RulesEngine().apply(dict(request))
+        def build_trip(self, request: dict[str, Any]) -> dict[str, Any]:
+    start_time = time.monotonic()
+
+    # FIXED: evaluate_rules returns a validation status, NOT the request —
+    # keep the original request intact.
+    rules_result = RulesEngine().evaluate_rules(dict(request))
+    if rules_result.get("status") != "success" or not rules_result.get("validated", False):
+        logger.warning("Rules validation did not pass: %s", rules_result)
+
+    request = dict(request)
 
         destination_slugs: list[str] = request["destinations"]
         days = request["days"]
