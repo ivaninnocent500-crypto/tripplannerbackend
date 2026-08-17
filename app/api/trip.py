@@ -1,178 +1,158 @@
 """
-Trip planner API routes.
+New routes for the trip-instance lifecycle. These sit alongside your
+existing app/api/trip.py (POST /api/itineraries/generate) rather than
+replacing it outright — see GAP_ANALYSIS.md for the recommended
+migration path (point the Android app at these once verified, then
+retire the old ephemeral response shape).
 
-This is the FIRST real FastAPI route file for this project — per the
-master migration prompt's own rule ("If an endpoint does not exist, do
-not silently fake it in Kotlin. Document it as a backend contract
-requirement"), the Android TravelApi.kt must be built against THIS file,
-not the conceptual /api/... list from the planning document. Only routes
-that are actually implemented and wired to real engines are exposed here.
-
-Endpoints in this delivery:
-    GET /api/health
-    POST /api/itineraries/generate
-
-Endpoints intentionally NOT included (see schemas.py for why):
-    /api/assistant/message -> Jabari stays on its current direct-Gemini
-                                architecture per explicit instruction;
-                                not part of this migration.
-    /api/inquiries -> no InquiryEngine/persistence exists yet;
-                                wiring this now would mean inventing
-                                storage rather than connecting real code.
-    /api/destinations/* -> no DestinationEngine/aggregation service
-                                exists yet in the shared code; see
-                                MIGRATION_NOTES.md for the follow-up.
-    /api/operators/compare -> OperatorEngine.rank() exists and IS wired
-                                below via the trip response's operators
-                                block; a standalone comparison endpoint
-                                would need new engine logic, not yet built.
+I don't have your app/api/auth.py or app/db/session.py contents beyond
+what's imported in your existing trip.py, so `require_api_key` /
+`get_supabase_db` below are assumed to have the same signatures you
+already use.
 """
 from __future__ import annotations
-
-import logging
-import os
-import time
-import uuid
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.api.auth import require_api_key
-from app.api.schemas import (
-    ErrorResponse,
-    GenerateTripRequest,
-    GenerateTripResponse,
-    HealthResponse,
-    ResponseMetadata,
-)
-from app.core.orchestrator import TripOrchestrator
-from app.db.session import (
-    DatabaseNotConfiguredError,
-    check_legacy_connection,
-    check_supabase_connection,
-    get_legacy_db,
-    get_supabase_db,
-)
+from app.db.session import get_supabase_db
+from app.db.destinations import resolve_slugs_to_ids
+from app.db.models_furniture import Bench, Cabinet, Counter, Wardrobe
+from app.engines.itinerary_v2 import ItineraryPlanningEngine
+from app.engines.validation import ValidationEngine
+from app.engines.explanation import ExplanationEngine
+from app.engines.operator_match_v2 import OperatorMatchEngine
+from app.engines.quote_engine import QuoteEngine
+from app.engines.booking_engine import BookingEngine
 
-logger = logging.getLogger(__name__)
-
-router = APIRouter(tags=["trip"])
+router = APIRouter(prefix="/api/trips", tags=["trips-v2"])
 
 
-@router.get("/health", response_model=HealthResponse)
-def health_check() -> HealthResponse:
-    """
-    Unauthenticated on purpose — Render's own health checks and simple
-    uptime monitors need to hit this without a key. It reports connection
-    status but never leaks connection strings or credentials.
-    """
-    supabase_ok = False
-    legacy_ok = False
-
-    # Check Supabase Database Connection
-    try:
-        supabase_ok = check_supabase_connection()
-        if not supabase_ok:
-            logger.error("❌ Health Check: check_supabase_connection() returned False.")
-    except Exception as exc:
-        logger.exception("❌ Health Check - Supabase Connection Exception: %s", exc)
-
-    # Check Legacy Database Connection
-    try:
-        legacy_ok = check_legacy_connection()
-        if not legacy_ok:
-            logger.error("❌ Health Check: check_legacy_connection() returned False.")
-    except Exception as exc:
-        logger.exception("❌ Health Check - Legacy DB Connection Exception: %s", exc)
-
-    # Check AI Gateway Environment Flag
-    ai_enabled = os.environ.get("ATI_AI_ENABLED", "false").lower() == "true"
-    if not ai_enabled:
-        logger.info("ℹ️ Health Check: ATI_AI_ENABLED is set to False or not configured.")
-
-    return HealthResponse(
-        status="ok" if (supabase_ok and legacy_ok) else "degraded",
-        supabase_connected=supabase_ok,
-        legacy_db_connected=legacy_ok,
-        ai_gateway_enabled=ai_enabled,
-    )
+def _get_cabinet_or_404(db: Session, cabinet_id: str) -> Cabinet:
+    cabinet = db.get(Cabinet, cabinet_id)
+    if not cabinet:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Trip not found")
+    return cabinet
 
 
-@router.post(
-    "/itineraries/generate",
-    response_model=GenerateTripResponse,
-    responses={
-        401: {"model": ErrorResponse},
-        422: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
-        503: {"model": ErrorResponse},
-    },
-)
-def generate_itinerary(
-    request: GenerateTripRequest,
-    supabase_db: Session = Depends(get_supabase_db),
-    legacy_db: Session = Depends(get_legacy_db),
-    _auth: None = Depends(require_api_key),
-) -> GenerateTripResponse:
-    """
-    The single most important endpoint in this migration — this is the
-    HTTP front door for what your master prompt calls the "new flow":
+# ---------------------------------------------------------------------
+@router.post("/generate")
+def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    slug_to_id = resolve_slugs_to_ids(db, request["destinations"])
+    ordered_ids = [slug_to_id[s] for s in request["destinations"] if s in slug_to_id]
+    if not ordered_ids:
+        raise HTTPException(422, "None of the requested destinations could be resolved.")
 
-        Android -> TravelRepository.generateItinerary()
-                -> POST /api/itineraries/generate
-                -> TripOrchestrator.build_trip()
-                -> Supabase + engines + AI gateway
-                -> structured JSON
-                -> Android ItineraryViewModel
+    result = ItineraryPlanningEngine(db).build(request, ordered_ids)
+    validation = ValidationEngine(db).validate(result.cabinet)
+    why = ExplanationEngine().explain(result.cabinet)
+    db.commit()
 
-    No business logic lives here. This route's only job is: validate the
-    request shape (Pydantic), open sessions, call the orchestrator exactly
-    as tests/test_two_database_wiring.py expects it to be called, and wrap
-    the result with response metadata. Every calculation, retrieval, and
-    scoring decision stays inside orchestrator.py / app/engines/*.py,
-    unchanged.
-    """
-    request_id = str(uuid.uuid4())
-    started = time.monotonic()
+    return {
+        "cabinet_id": str(result.cabinet.id),
+        "status": result.cabinet.status,
+        "validation": validation,
+        "why_itinerary": why["facts"],
+        "days": [_day_to_dict(s) for s in result.cabinet.shelves],
+    }
 
-    orchestrator = TripOrchestrator(supabase_db=supabase_db, legacy_db=legacy_db)
 
-    try:
-        result = orchestrator.build_trip(request.to_orchestrator_dict())
-    except DatabaseNotConfiguredError as exc:
-        logger.error("Database not configured for request %s: %s", request_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
-    except Exception as exc: # noqa: BLE001
-        # The orchestrator already wraps each engine call in
-        # call_engine()/EngineResilienceWrapper with per-engine fallbacks
-        # (see orchestrator.py — itinerary_result, operator_result, etc.
-        # all degrade gracefully rather than raising). An exception
-        # reaching this point means something OUTSIDE that resilience
-        # wrapping failed (e.g. the initial RulesEngine().apply() call,
-        # or a DB connection dying mid-request) — a genuine 500, not a
-        # degraded-but-successful trip.
-        logger.exception("Unhandled error generating trip for request %s", request_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Trip generation failed unexpectedly. Please try again.",
-        ) from exc
+@router.get("/{cabinet_id}")
+def get_trip(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    cabinet = _get_cabinet_or_404(db, cabinet_id)
+    return {
+        "cabinet_id": str(cabinet.id),
+        "title": cabinet.title,
+        "status": cabinet.status,
+        "duration_days": cabinet.duration_days,
+        "travelers": cabinet.travelers_adults + cabinet.travelers_children,
+        "style": cabinet.travel_style,
+        "route": [str(x) for x in cabinet.route_destination_ids],
+        "dates": {"start": cabinet.start_date, "end": cabinet.end_date},
+        "estimated_budget": {"low": cabinet.estimated_budget_low, "high": cabinet.estimated_budget_high},
+        "days": [_day_to_dict(s) for s in cabinet.shelves],
+        "why_itinerary": ExplanationEngine().explain(cabinet)["facts"],
+    }
 
-    elapsed_ms = int((time.monotonic() - started) * 1000)
-    degraded = bool(result.get("trip", {}).get("generation_meta", {}).get("degraded", False))
 
-    return GenerateTripResponse(
-        trip=result["trip"],
-        ai_enhancements=result["ai_enhancements"],
-        metadata=ResponseMetadata(
-            request_id=request_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            source="render-backend",
-            data_freshness=f"{elapsed_ms}ms generation time",
-            degraded=degraded,
-        ),
-    )
+# ---------------------------------------------------------------------
+@router.post("/{cabinet_id}/match-operators")
+def match_operators(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    cabinet = _get_cabinet_or_404(db, cabinet_id)
+    stools = OperatorMatchEngine(db).match(cabinet)
+    cabinet.status = "matching"
+    db.add(cabinet)
+    db.commit()
+    return {"matches": [
+        {
+            "tour_operator_id": str(s.tour_operator_id),
+            "trip_match_pct": s.trip_match_pct,
+            "badge": s.badge,
+            "strengths": s.strengths,
+            "estimated_price_pp": float(s.estimated_price_pp) if s.estimated_price_pp else None,
+        } for s in stools
+    ]}
 
+
+# ---------------------------------------------------------------------
+@router.post("/{cabinet_id}/quotes/request")
+def request_quotes(cabinet_id: str, body: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    cabinet = _get_cabinet_or_404(db, cabinet_id)
+    benches = QuoteEngine(db).request_quotes(cabinet, body["tour_operator_ids"], body.get("note"))
+    db.commit()
+    return {"benches": [str(b.id) for b in benches], "status": "request_sent"}
+
+
+@router.get("/{cabinet_id}/quotes")
+def track_quotes(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    cabinet = _get_cabinet_or_404(db, cabinet_id)
+    return QuoteEngine(db).tracking_summary(cabinet)
+
+
+@router.get("/{cabinet_id}/quotes/compare")
+def compare_quotes(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    cabinet = _get_cabinet_or_404(db, cabinet_id)
+    return QuoteEngine(db).compare(cabinet)
+
+
+# ---------------------------------------------------------------------
+@router.post("/{cabinet_id}/book")
+def book_trip(cabinet_id: str, body: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    cabinet = _get_cabinet_or_404(db, cabinet_id)
+    counter = db.get(Counter, body["counter_id"])
+    if not counter:
+        raise HTTPException(404, "Quote not found")
+    wardrobe = BookingEngine(db).create_booking(cabinet, counter)
+    db.commit()
+    return {"wardrobe_id": str(wardrobe.id), "confirmation_code": wardrobe.confirmation_code,
+            "total_price": float(wardrobe.total_price), "deposit_amount": float(wardrobe.deposit_amount),
+            "status": wardrobe.status}
+
+
+@router.post("/bookings/{wardrobe_id}/confirm")
+def confirm_booking(wardrobe_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    wardrobe = db.get(Wardrobe, wardrobe_id)
+    if not wardrobe:
+        raise HTTPException(404, "Booking not found")
+    BookingEngine(db).confirm_booking(wardrobe)
+    db.commit()
+    return {"confirmation_code": wardrobe.confirmation_code, "status": wardrobe.status}
+
+
+# ---------------------------------------------------------------------
+def _day_to_dict(shelf) -> dict:
+    return {
+        "day": shelf.day_number,
+        "date": shelf.date,
+        "destination_id": str(shelf.destination_id) if shelf.destination_id else None,
+        "theme": shelf.theme,
+        "activities": [
+            {"name": d.name, "description": d.description, "start_time": str(d.start_time) if d.start_time else None,
+             "duration_minutes": d.duration_minutes, "type": d.activity_type}
+            for d in sorted(shelf.drawers, key=lambda x: x.sort_order)
+        ],
+        "accommodation": shelf.headboards[0].name if shelf.headboards else None,
+        "transport": shelf.armrests[0].description if shelf.armrests else None,
+        "meals": [t.meal_type for t in shelf.trays if t.included],
+    }
