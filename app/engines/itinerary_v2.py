@@ -1521,8 +1521,3 @@ class ItineraryPlanningEngine:
         return f"{country}, Wild & Unhurried"
 
 
-
-
-git add app/engines/itinerary_v2.py
-git commit -m "Fix parameter casting in itinerary_v2 for psycopg3"
-git push origin main
