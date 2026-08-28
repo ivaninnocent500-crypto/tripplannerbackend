@@ -26,8 +26,7 @@ Design goals
 9. Optional Photo States integration.
 10. SQLAlchemy/PostgreSQL-safe bind syntax using CAST() instead of :: inline casting.
 """
-
-from __future__ annotations
+from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
