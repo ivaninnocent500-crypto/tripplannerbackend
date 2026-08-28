@@ -16,12 +16,12 @@ kept, but with the bugs found in that pass fixed:
      (including this method's own later queries, and the route's final
      db.commit()) then fails too. Fixed: db.rollback() in the except
      block, same as resilience.py's call_engine().
-  2. UNUSED `rating` (a real bug, not just a style nit): V3 pulled
-     `t.rating` out of the candidates row but never used it anywhere in
-     scoring — trust and service were computed from years/reviews only.
-     A 4.9-rated operator and a 3.2-rated operator with the same years
-     and review count would have scored identically. Restored: rating
-     factors into trust.
+  2. UNUSED `rating` & TYPE MISMATCH FIX: V3 pulled `t.rating` out of
+     the candidates row but never used it anywhere in scoring. Restored:
+     rating factors into trust. Crucially, psycopg/PostgreSQL returns
+     `rating` as a `decimal.Decimal`, which crashes Python when mixed with
+     floating-point arithmetic (`rating - 3.0`). Fixed: explicitly cast
+     `rating` to `float` upon unpacking.
   3. HONEST NAMING: "country_match" implied verified legal cross-border
      licensing. What the query actually measures is "this operator has
      listed destination coverage in this country" — renamed to
@@ -105,22 +105,22 @@ class OperatorMatchEngine:
 
         scored: list[dict[str, Any]] = []
         for row in candidates:
-            op_id, name, verification, years, rating, review_count, hq_country = row
-            years, rating, review_count = years or 0, rating or 4.0, review_count or 0
+            op_id, name, verification, years, raw_rating, review_count, hq_country = row
+            years = years or 0
+            rating = float(raw_rating) if raw_rating is not None else 4.0
+            review_count = review_count or 0
 
             coverage_pct = self._coverage_pct(op_id, route)
             activity_pct, activity_method = self._activity_fit(op_id, activity_caps)
             lodge_pct, lodge_method = self._lodge_fit(op_id, lodge_partners)
 
-            # rating now actually factors into trust — a 4.9-rated
-            # operator and a 3.2-rated one with identical years/reviews
-            # no longer score identically (the bug found in the
-            # supplied V3 pass: `rating` was extracted and never used).
+            # rating now actually factors into trust — cast to float ensures decimal.Decimal
+            # from PostgreSQL does not cause a TypeError on subtraction with float literals.
             trust = min(100, int(50 + years * 2 + (review_count >= 50) * 10
                                   + (verification == "verified") * 5 + (rating - 3.0) * 10))
             trust = max(0, trust)
             service = max(50, min(95, int(50 + (review_count ** 0.5) * 4)))
-            value = PLACEHOLDER_CAP  # no real pricing feed exists yet — see gap notes below
+            value = PLACEHOLDER_CAP # no real pricing feed exists yet — see gap notes below
 
             methods = {
                 "experience_fit_method": activity_method,
@@ -146,7 +146,7 @@ class OperatorMatchEngine:
             # standing in for missing data.
             real_weight = sum(
                 weights[k] for k in weights if k in fields
-                and not (k == "value")  # value has no real source at all yet
+                and not (k == "value") # value has no real source at all yet
                 and not (k == "experience_fit" and activity_method.startswith("placeholder"))
                 and not (k == "accommodation_fit" and lodge_method.startswith("placeholder"))
             )
@@ -296,3 +296,4 @@ class OperatorMatchEngine:
         if s["trust"] >= 85:
             out.append("Verified operator with a strong track record")
         return out or ["Fits the core requirements of your trip"]
+
