@@ -78,13 +78,9 @@ class OperatorMatchEngine:
         self.db = db
 
     def match(self, cabinet: Cabinet, limit: int = 3) -> list[Stool]:
-        # Idempotent: clear any previous matches for this cabinet before
-        # computing fresh ones — see the docstring in the original
-        # single-country version of this engine for why (client retries
-        # after a slow/timed-out request would otherwise hit the
-        # unique(cabinet_id, tour_operator_id) constraint and crash).
-        self.db.query(Stool).filter(Stool.cabinet_id == cabinet.id).delete()
-        self.db.flush()
+        # Synchronize ORM session on delete so SQLAlchemy purges cached state
+        self.db.query(Stool).filter(Stool.cabinet_id == cabinet.id).delete(synchronize_session="fetch")
+        self.db.commit()
 
         route = cabinet.route_destination_ids or []
         route_countries = list(cabinet.route_countries or []) or self._infer_countries(route)
@@ -114,13 +110,11 @@ class OperatorMatchEngine:
             activity_pct, activity_method = self._activity_fit(op_id, activity_caps)
             lodge_pct, lodge_method = self._lodge_fit(op_id, lodge_partners)
 
-            # rating now actually factors into trust — cast to float ensures decimal.Decimal
-            # from PostgreSQL does not cause a TypeError on subtraction with float literals.
             trust = min(100, int(50 + years * 2 + (review_count >= 50) * 10
                                   + (verification == "verified") * 5 + (rating - 3.0) * 10))
             trust = max(0, trust)
             service = max(50, min(95, int(50 + (review_count ** 0.5) * 4)))
-            value = PLACEHOLDER_CAP # no real pricing feed exists yet — see gap notes below
+            value = PLACEHOLDER_CAP
 
             methods = {
                 "experience_fit_method": activity_method,
@@ -141,12 +135,9 @@ class OperatorMatchEngine:
 
             trip_match = round(sum(fields[k] * weights[k] for k in weights if k in fields))
 
-            # confidence: weighted share of the score that came from a
-            # real (non-placeholder) sub-score, not from PLACEHOLDER_CAP
-            # standing in for missing data.
             real_weight = sum(
                 weights[k] for k in weights if k in fields
-                and not (k == "value") # value has no real source at all yet
+                and not (k == "value")
                 and not (k == "experience_fit" and activity_method.startswith("placeholder"))
                 and not (k == "accommodation_fit" and lodge_method.startswith("placeholder"))
             )
@@ -185,7 +176,7 @@ class OperatorMatchEngine:
             self.db.add(stool)
             stools.append(stool)
 
-        self.db.flush()
+        self.db.commit()
         return stools
 
     # ------------------------------------------------------------------
@@ -206,15 +197,6 @@ class OperatorMatchEngine:
         return int(100 * n / max(1, len(route)))
 
     def _country_coverage_pct(self, op_id: str, route_countries: list[str], hq_country: str | None) -> int:
-        """
-        Measures destination-level coverage across every country on the
-        route — NOT verified legal cross-border licensing, which this
-        schema has no data for. An operator active only in Kenya scores
-        low on a Kenya+Tanzania+Rwanda trip even if their Kenya coverage
-        alone is 100%. Headquarters country is a weak secondary nudge
-        (suggests easier logistics in that one country), not a
-        dominant factor.
-        """
         rows = self.db.execute(text("""
             select distinct tp.country::text
             from destination_tour_operators dto
@@ -241,10 +223,6 @@ class OperatorMatchEngine:
             """), {"op_ids": op_ids}).fetchall()
             return {r[0]: int(r[1]) for r in rows}
         except Exception:
-            # Table may not exist yet in every environment (schema/005
-            # not yet run) — roll back so this failure doesn't poison
-            # every query for the rest of this request (the same bug
-            # class fixed in resilience.py's call_engine()).
             self.db.rollback()
             return {}
 
