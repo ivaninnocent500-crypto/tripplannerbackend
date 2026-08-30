@@ -68,7 +68,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from day_archetype import DayArchetypeEngine
+from app.engines.day_archetype import DayArchetypeEngine
 from itinerary_planning_engine import ItineraryPlanningEngine
 from pipeline_adapters import (
     archetypes_by_day_number,
