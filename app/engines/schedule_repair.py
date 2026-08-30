@@ -18,7 +18,7 @@ from app.engines.activity_constraints import (
     ActivityProfile,
     TimeWindow,
 )
-from day_archetype import (
+from app.engines.day_archetype import DayArchetypeEngine (
     DayArchetype,
     DayArchetypeResult,
 )
