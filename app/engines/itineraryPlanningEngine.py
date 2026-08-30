@@ -1218,43 +1218,43 @@ class ItineraryPlanningEngine:
         return allocation, warnings
 
     def _populate_headboard(self, shelf: Shelf, dest_id: str, budget_tier: str, remaining_nights_here: int) -> None:
-    tier_map = {
-        "budget": ("budget", "camping"),
-        "mid": ("mid_range",),
-        "luxury": ("luxury", "ultra_luxury"),
-    }
-    tiers = tier_map.get(budget_tier, ("mid_range",))
+        tier_map = {
+            "budget": ("budget", "camping"),
+            "mid": ("mid_range",),
+            "luxury": ("luxury", "ultra_luxury"),
+        }
+        tiers = tier_map.get(budget_tier, ("mid_range",))
 
-    row = self.db.execute(
-        text(
-            """
-            SELECT id, name, tier
-            FROM lodges
-            WHERE destination_id = CAST(:dest_id AS uuid)
-              AND tier::text = ANY(CAST(:tiers AS text[]))
-            ORDER BY star_rating DESC NULLS LAST
-            LIMIT 1
-            """
-        ),
-        {"dest_id": dest_id, "tiers": list(tiers)},
-    ).fetchone()
+        row = self.db.execute(
+            text(
+                """
+                SELECT id, name, tier
+                FROM lodges
+                WHERE destination_id = CAST(:dest_id AS uuid)
+                  AND tier::text = ANY(CAST(:tiers AS text[]))
+                ORDER BY star_rating DESC NULLS LAST
+                LIMIT 1
+                """
+            ),
+            {"dest_id": dest_id, "tiers": list(tiers)},
+        ).fetchone()
 
-    check_out = None
-    if shelf.date and remaining_nights_here > 0:
-        check_out = shelf.date + timedelta(days=remaining_nights_here)
+        check_out = None
+        if shelf.date and remaining_nights_here > 0:
+            check_out = shelf.date + timedelta(days=remaining_nights_here)
 
-    if row:
-        headboard = Headboard(
-            shelf_id=shelf.id, lodge_id=row[0], name=row[1], tier=row[2],
-            check_in=shelf.date, check_out=check_out, nights=remaining_nights_here,
-        )
-    else:
-        headboard = Headboard(
-            shelf_id=shelf.id, name=f"{budget_tier.title()} lodge", tier=budget_tier,
-            check_in=shelf.date, check_out=check_out, nights=remaining_nights_here,
-        )
+        if row:
+            headboard = Headboard(
+                shelf_id=shelf.id, lodge_id=row[0], name=row[1], tier=row[2],
+                check_in=shelf.date, check_out=check_out, nights=remaining_nights_here,
+            )
+        else:
+            headboard = Headboard(
+                shelf_id=shelf.id, name=f"{budget_tier.title()} lodge", tier=budget_tier,
+                check_in=shelf.date, check_out=check_out, nights=remaining_nights_here,
+            )
 
-    self.db.add(headboard)
+        self.db.add(headboard)
 
 
     def _populate_armrest(self, shelf: Shelf, legs: list[dict[str, Any]], destination_index: int, is_arrival_day: bool) -> None:
