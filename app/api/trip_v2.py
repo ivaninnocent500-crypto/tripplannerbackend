@@ -44,6 +44,7 @@ router = APIRouter(prefix="/api/trips", tags=["trips"])
 def _get_cabinet_or_404(db: Session, cabinet_id: str) -> Cabinet:
     cabinet = db.get(Cabinet, cabinet_id)
     if not cabinet:
+        logger.warning("Cabinet ID %s not found in database", cabinet_id)
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Trip not found")
     return cabinet
 
@@ -62,6 +63,7 @@ def _operator_summary(db: Session, tour_operator_id) -> dict:
 # ---------------------------------------------------------------------
 @router.post("/generate")
 def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing POST /generate with payload: %s", request)
     rules_result = RulesEngine().evaluate_rules(dict(request))
     if rules_result.get("status") != "success" or not rules_result.get("validated", False):
         logger.warning("Rules validation did not pass: %s", rules_result)
@@ -70,6 +72,7 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
     ordered_ids = [slug_to_id[s] for s in request["destinations"] if s in slug_to_id]
     unmatched = [s for s in request["destinations"] if s not in slug_to_id]
     if not ordered_ids:
+        logger.error("Failed to resolve destination slugs for request: %s", request["destinations"])
         raise HTTPException(422, "None of the requested destinations could be resolved.")
 
     build_result = call_engine(
@@ -78,6 +81,7 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
         fallback=None, db=db,
     )
     if build_result.value is None:
+        logger.error("ItineraryPlanningEngine execution returned None")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Trip generation failed unexpectedly.")
 
     cabinet = build_result.value.cabinet
@@ -96,6 +100,8 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
 
     db.commit()
 
+    logger.info("Trip successfully generated with Cabinet ID: %s", cabinet.id)
+
     return {
         "cabinet_id": str(cabinet.id),
         "status": cabinet.status,
@@ -111,6 +117,7 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
 
 @router.get("/{cabinet_id}")
 def get_trip(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing GET /%s", cabinet_id)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     explanation_result = call_engine(
         "ExplanationEngine", lambda: ExplanationEngine().explain(cabinet), fallback={"facts": []}, db=db,
@@ -133,6 +140,7 @@ def get_trip(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(
 # ---------------------------------------------------------------------
 @router.post("/{cabinet_id}/match-operators")
 def match_operators(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing POST /%s/match-operators", cabinet_id)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     match_result = call_engine(
         "OperatorMatchEngine", lambda: OperatorMatchEngine(db).match(cabinet), fallback=[], db=db,
@@ -159,12 +167,14 @@ def match_operators(cabinet_id: str, db: Session = Depends(get_supabase_db), _=D
             "estimated_price_pp": float(s.estimated_price_pp) if s.estimated_price_pp else None,
         })
 
+    logger.info("Matched %d operators for cabinet: %s", len(matches), cabinet_id)
     return {"degraded": match_result.degraded, "matches": matches}
 
 
 # ---------------------------------------------------------------------
 @router.post("/{cabinet_id}/quotes/request")
 def request_quotes(cabinet_id: str, body: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing POST /%s/quotes/request with body: %s", cabinet_id, body)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     result = call_engine(
         "QuoteEngine.request_quotes",
@@ -172,11 +182,13 @@ def request_quotes(cabinet_id: str, body: dict, db: Session = Depends(get_supaba
         fallback=[], db=db,
     )
     db.commit()
+    logger.info("Quotes requested successfully for cabinet: %s", cabinet_id)
     return {"degraded": result.degraded, "benches": [str(b.id) for b in result.value], "status": "request_sent"}
 
 
 @router.get("/{cabinet_id}/quotes")
 def track_quotes(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing GET /%s/quotes", cabinet_id)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     result = call_engine(
         "QuoteEngine.tracking_summary", lambda: QuoteEngine(db).tracking_summary(cabinet),
@@ -187,6 +199,7 @@ def track_quotes(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depe
 
 @router.get("/{cabinet_id}/quotes/compare")
 def compare_quotes(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing GET /%s/quotes/compare", cabinet_id)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     result = call_engine(
         "QuoteEngine.compare", lambda: QuoteEngine(db).compare(cabinet),
@@ -207,9 +220,11 @@ def get_visa_info(
     coverage, or an explicit unverified flag — see VisaIntelligenceEngine's
     docstring for why it never guesses.
     """
+    logger.info("Executing GET /%s/visa-info for nationality: %s", cabinet_id, nationality)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     destination_countries = list(cabinet.route_countries or [])
     if not destination_countries:
+        logger.error("Cabinet %s has no route_countries recorded", cabinet_id)
         raise HTTPException(422, "This trip has no route_countries recorded — regenerate the itinerary first.")
 
     result = call_engine(
@@ -223,34 +238,42 @@ def get_visa_info(
 # ---------------------------------------------------------------------
 @router.post("/{cabinet_id}/book")
 def book_trip(cabinet_id: str, body: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing POST /%s/book with body: %s", cabinet_id, body)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     counter = db.get(Counter, body["counter_id"])
     if not counter:
+        logger.warning("Counter ID %s not found for booking", body.get("counter_id"))
         raise HTTPException(404, "Quote not found")
 
     result = call_engine(
         "BookingEngine.create_booking", lambda: BookingEngine(db).create_booking(cabinet, counter), fallback=None, db=db,
     )
     if result.value is None:
+        logger.error("BookingEngine.create_booking returned None for cabinet: %s", cabinet_id)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Booking failed unexpectedly.")
 
     db.commit()
+    logger.info("Booking created successfully with Wardrobe ID: %s", result.value.id)
     return _wardrobe_to_dict(db, result.value)
 
 
 @router.post("/bookings/{wardrobe_id}/confirm")
 def confirm_booking(wardrobe_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing POST /bookings/%s/confirm", wardrobe_id)
     wardrobe = db.get(Wardrobe, wardrobe_id)
     if not wardrobe:
+        logger.warning("Wardrobe ID %s not found for confirmation", wardrobe_id)
         raise HTTPException(404, "Booking not found")
 
     result = call_engine(
         "BookingEngine.confirm_booking", lambda: BookingEngine(db).confirm_booking(wardrobe), fallback=None, db=db,
     )
     if result.value is None:
+        logger.error("BookingEngine.confirm_booking returned None for wardrobe: %s", wardrobe_id)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Confirmation failed unexpectedly.")
 
     db.commit()
+    logger.info("Booking confirmed successfully for Wardrobe ID: %s", wardrobe_id)
     return _wardrobe_to_dict(db, wardrobe)
 
 
