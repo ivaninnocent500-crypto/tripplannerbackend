@@ -36,6 +36,10 @@ from app.engines.operator_match_v2 import OperatorMatchEngine
 from app.engines.quote_engine import QuoteEngine
 from app.engines.booking_engine import BookingEngine
 from app.engines.visa_engine import VisaIntelligenceEngine
+import sys
+
+# Attach to uvicorn's active handler so messages stream to Render stdout
+logger = logging.getLogger("uvicorn.error")
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/trips", tags=["trips"])
