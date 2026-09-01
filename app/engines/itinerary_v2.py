@@ -9,26 +9,26 @@ Wires the full pipeline established in the audit-locked architecture:
     TRIP REQUEST
         |
         v
-    RulesEngine            <- pre-flight request validation (fail fast)
+    RulesEngine <- pre-flight request validation (fail fast)
         |
         v
-    RouteGeographyEngine    <- factual geographic analysis
+    RouteGeographyEngine <- factual geographic analysis
         |
         v
-    DayArchetypeEngine       <- classify each day's operational role
+    DayArchetypeEngine <- classify each day's operational role
         |
         v
-    ItineraryPlanningEngine  <- build the persisted Cabinet/Shelf/Drawer/...
+    ItineraryPlanningEngine <- build the persisted Cabinet/Shelf/Drawer/...
         |
         v
-    ScheduleRepairEngine     <- validate + repair the built schedule
+    ScheduleRepairEngine <- validate + repair the built schedule
                                 (internally normalizes each activity via
                                  ActivityConstraintsEngine -- this
                                  orchestrator does not call that engine
                                  a second time)
         |
         v
-    ValidationEngine         <- final domain validation, archetype-aware
+    ValidationEngine <- final domain validation, archetype-aware
         |
         v
     Persisted Cabinet (status = "ready" | "draft")
@@ -58,6 +58,25 @@ ItineraryPlanningEngine.build() and ValidationEngine.validate() already
 do -- it only sequences calls and translates data between engines via
 pipeline_adapters.py. The caller (API layer / task queue / etc.) owns
 the SQLAlchemy transaction and commit/rollback decision.
+
+CHANGE LOG
+-----------
+FIX (production incident): the ItineraryPlanningEngine import below
+previously read:
+
+    from app.engines.itineraryPlanningEngine import ItineraryPlanningEngine
+
+but the actual file is app/engines/ItineraryPlanningEngine.py
+(PascalCase). On Render's case-sensitive Linux filesystem this import
+does not resolve to the real file. This is corrected below to match
+the real filename exactly. This was the root cause of every day in a
+generated itinerary showing identical fixed time slots and a
+repeating "Deeper into the park" theme -- with this import broken,
+ItineraryOrchestrator itself could never load, so
+app/api/trip_v2.py's /generate route (see that file's own fix) was
+calling ItineraryPlanningEngine.build() directly with no
+RouteGeographyEngine, DayArchetypeEngine, or ScheduleRepairEngine ever
+running.
 """
 
 from __future__ import annotations
@@ -69,7 +88,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.engines.day_archetype import DayArchetypeEngine
-from app.engines.itineraryPlanningEngine import ItineraryPlanningEngine
+from app.engines.ItineraryPlanningEngine import ItineraryPlanningEngine
 from app.engines.pipeline_adapters import (
     archetypes_by_day_number,
     day_records_from_route_analysis,
@@ -136,17 +155,6 @@ class ItineraryOrchestrator:
         self.rules_engine = RulesEngine()
         self.route_geography_engine = RouteGeographyEngine(db)
         self.day_archetype_engine = DayArchetypeEngine()
-        # ActivityConstraintsEngine is NOT called directly from this
-        # orchestrator. ScheduleRepairEngine._activity_from_record()
-        # (schedule_repair.py) already instantiates and calls
-        # ActivityConstraintsEngine().normalize() internally for every
-        # activity it processes -- calling it again here would be
-        # redundant work, not an additional check. If a future need
-        # arises to inspect constraints/validations independent of
-        # scheduling (e.g. a pre-flight "can these activities even
-        # coexist" check before ItineraryPlanningEngine.build() runs),
-        # add that call explicitly here rather than reviving an unused
-        # instance attribute.
         self.itinerary_planning_engine = ItineraryPlanningEngine(db)
         self.schedule_repair_engine = ScheduleRepairEngine()
         self.validation_engine = ValidationEngine(db)
@@ -160,11 +168,6 @@ class ItineraryOrchestrator:
     ) -> ItineraryGenerationResult:
 
         result = ItineraryGenerationResult()
-
-        # ------------------------------------------------------------
-        # STAGE 1: RulesEngine -- fail fast on a structurally invalid
-        # request before touching the database for anything expensive.
-        # ------------------------------------------------------------
 
         rules_input = self._rules_input_from_request(request, destination_ids)
         rules_result = self.rules_engine.evaluate_rules(rules_input)
@@ -181,11 +184,6 @@ class ItineraryOrchestrator:
 
         result.warnings.extend(rules_result["warnings"])
 
-        # ------------------------------------------------------------
-        # STAGE 2: RouteGeographyEngine -- factual geography, in the
-        # caller's requested order. Never reordered here.
-        # ------------------------------------------------------------
-
         route_analysis = self.route_geography_engine.analyze(
             destination_ids,
             allow_coordinate_estimate=allow_coordinate_estimate,
@@ -198,14 +196,6 @@ class ItineraryOrchestrator:
                 "RouteGeographyEngine could not resolve any destinations "
                 "for this request."
             )
-
-        # ------------------------------------------------------------
-        # STAGE 3: ItineraryPlanningEngine -- build the persisted
-        # Cabinet. This is where day allocation actually happens, so we
-        # need its allocation output before we can build accurate
-        # day_archetype records (which need to know which day is the
-        # first day at each destination).
-        # ------------------------------------------------------------
 
         try:
             build_result = self.itinerary_planning_engine.build(
@@ -220,12 +210,6 @@ class ItineraryOrchestrator:
         cabinet = build_result.cabinet
         result.cabinet = cabinet
         result.warnings.extend(build_result.warnings)
-
-        # ------------------------------------------------------------
-        # STAGE 4: DayArchetypeEngine -- classify each persisted day
-        # using the route geography facts + the cabinet's actual
-        # per-day activity counts, now that the cabinet exists.
-        # ------------------------------------------------------------
 
         nights_per_destination = self._nights_per_destination_from_cabinet(cabinet)
 
@@ -247,12 +231,6 @@ class ItineraryOrchestrator:
         day_plan = self.day_archetype_engine.analyze(day_records)
         result.day_plan = day_plan
         result.warnings.extend(day_plan.warnings)
-
-        # ------------------------------------------------------------
-        # STAGE 5: ScheduleRepairEngine -- validate + repair the
-        # already-built schedule, using the day archetypes just
-        # computed to know each day's activity-capacity ceiling.
-        # ------------------------------------------------------------
 
         schedule_input = schedule_input_from_cabinet(cabinet)
         archetypes = archetypes_by_day_number(day_plan)
@@ -278,11 +256,6 @@ class ItineraryOrchestrator:
                 "repair and require manual review."
             )
 
-        # ------------------------------------------------------------
-        # STAGE 6: ValidationEngine -- final domain validation,
-        # archetype-aware for the departure-day accommodation question.
-        # ------------------------------------------------------------
-
         overnight_required = overnight_required_from_day_plan(day_plan)
 
         validation_result = self.validation_engine.validate(
@@ -295,24 +268,11 @@ class ItineraryOrchestrator:
 
         return result
 
-    # ------------------------------------------------------------------
-    # HELPERS
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _rules_input_from_request(
         request: dict[str, Any],
         destination_ids: list[str],
     ) -> dict[str, Any]:
-        """
-        Build the dict RulesEngine.evaluate_rules() expects from the
-        raw trip request. RulesEngine runs before any destination
-        metadata has been fetched from the database, so
-        destination_countries/inter_country/border_crossing_id are
-        deliberately left unset here -- RulesEngine treats their
-        absence as "not yet known," not as "false."
-        """
-
         return {
             "days": request.get("days"),
             "travelers": request.get("travelers", 1),
@@ -324,15 +284,6 @@ class ItineraryOrchestrator:
 
     @staticmethod
     def _nights_per_destination_from_cabinet(cabinet: Any) -> list[int]:
-        """
-        Recover the per-destination night allocation from the
-        persisted Cabinet's shelves, in destination order. This is the
-        actual allocation ItineraryPlanningEngine._allocate_days()
-        produced -- read back from what was persisted rather than
-        recomputed, so it can never drift from what the cabinet
-        actually contains.
-        """
-
         nights: list[int] = []
         current_destination = None
 
@@ -347,22 +298,6 @@ class ItineraryOrchestrator:
 
     @staticmethod
     def _apply_repair_actions_to_cabinet(cabinet: Any, repair_result: Any) -> None:
-        """
-        Apply ScheduleRepairEngine's MOVE/DELAY/ADVANCE actions back
-        onto the persisted Drawer rows.
-
-        schedule_repair.py operates on its own ScheduledActivity
-        copies (built from schedule_input_from_cabinet's plain dicts)
-        and never touches the ORM directly -- per the audit rule that
-        the four new engines must not create or mutate persistence
-        records themselves. This is therefore the one place that
-        translates a repair decision back into an ORM write, and it
-        does so narrowly: only start_time (and, for a cross-day MOVE,
-        which Shelf a Drawer belongs to) is ever changed. Duration,
-        name, description, and activity_id are never touched by a
-        repair action.
-        """
-
         from datetime import time as dt_time
 
         drawer_by_id: dict[Any, Any] = {
@@ -411,11 +346,6 @@ def generate_itinerary(
     *,
     allow_coordinate_estimate: bool = False,
 ) -> ItineraryGenerationResult:
-    """
-    Functional convenience wrapper for callers that do not need to
-    retain the orchestrator instance.
-    """
-
     return ItineraryOrchestrator(db).generate(
         request,
         destination_ids,
@@ -429,3 +359,4 @@ __all__ = [
     "ItineraryOrchestrator",
     "generate_itinerary",
 ]
+
