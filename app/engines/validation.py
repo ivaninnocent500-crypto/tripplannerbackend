@@ -434,6 +434,26 @@ class ValidationEngine:
                         message=message,
                     )
                 )
+            elif status == "visa_on_arrival":
+                # FIX (real-schema alignment): doc 18's border_status
+                # enum has a fifth value, visa_on_arrival, that was
+                # previously unhandled -- it fell through both branches
+                # silently (correctly not an error, but also silently
+                # not surfaced as useful information either). This is
+                # a genuinely helpful fact for a traveler to know in
+                # advance, so it now generates an informational note
+                # rather than staying invisible.
+                message = f"Crossing at {name} offers visa on arrival."
+                if visa_notes:
+                    message += f" {visa_notes}"
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        severity="warning",
+                        category="border",
+                        message=message,
+                    )
+                )
 
         return issues
 
