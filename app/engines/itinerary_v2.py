@@ -61,22 +61,39 @@ the SQLAlchemy transaction and commit/rollback decision.
 
 CHANGE LOG
 -----------
-FIX (production incident): the ItineraryPlanningEngine import below
-previously read:
+CORRECTION (this fix reverses a previous, incorrect one): an earlier
+pass "fixed" this import from
 
     from app.engines.itineraryPlanningEngine import ItineraryPlanningEngine
 
-but the actual file is app/engines/ItineraryPlanningEngine.py
-(PascalCase). On Render's case-sensitive Linux filesystem this import
-does not resolve to the real file. This is corrected below to match
-the real filename exactly. This was the root cause of every day in a
-generated itinerary showing identical fixed time slots and a
-repeating "Deeper into the park" theme -- with this import broken,
-ItineraryOrchestrator itself could never load, so
-app/api/trip_v2.py's /generate route (see that file's own fix) was
-calling ItineraryPlanningEngine.build() directly with no
-RouteGeographyEngine, DayArchetypeEngine, or ScheduleRepairEngine ever
-running.
+to
+
+    from app.engines.ItineraryPlanningEngine import ItineraryPlanningEngine
+
+on the theory that the real file was PascalCase and the lowercase
+form was a typo. That was wrong -- confirmed directly against the
+repository on GitHub (tripplannerbackend/app/engines/), the real,
+committed file is named itineraryPlanningEngine.py, lowercase i,
+camelCase throughout. The PascalCase form does not exist in the repo
+at all. Deploying the "fixed" version produced a real, loud
+ModuleNotFoundError on Render:
+
+    ModuleNotFoundError: No module named 'app.engines.ItineraryPlanningEngine'
+
+This is reverted below to the original, correct, lowercase-i import.
+The lesson: the file tree as typed out in conversation is not a
+substitute for checking the actual repository -- this was verified
+by mistake once already based on a hand-typed listing, and it was
+wrong. If this import is ever changed again, verify it against
+`ls app/engines/` or the GitHub file browser directly, not against a
+retyped tree.
+
+Separately and independently of this import path: the theme-repetition
+bug (every day of a multi-night stay showing "Deeper into the park")
+was real and is fixed by _apply_day_themes() below, which writes
+DayArchetypeEngine's per-day classification back onto each Shelf.theme
+after Stage 4. That fix does not depend on which case the import uses
+and remains correct regardless of this reversion.
 """
 
 from __future__ import annotations
@@ -88,7 +105,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.engines.day_archetype import DayArchetypeEngine
-from app.engines.ItineraryPlanningEngine import ItineraryPlanningEngine
+from app.engines.itineraryPlanningEngine import ItineraryPlanningEngine
 from app.engines.pipeline_adapters import (
     archetypes_by_day_number,
     day_records_from_route_analysis,
