@@ -11,9 +11,44 @@ the whole request. Every call_engine(...) here passes db=db so a caught
 engine failure rolls back the session — without that, a failed insert
 mid-engine leaves the transaction aborted and every subsequent query in
 the same request (including the route's own db.commit()) fails too,
-turning one soft "degraded" result into a hard 500. RulesEngine.evaluate_rules() runs first — it currently
-always returns {"status": "success", "validated": True} (a stub), so this
-just logs a warning if that ever changes rather than blocking requests.
+turning one soft "degraded" result into a hard 500.
+
+CHANGE LOG (production incident fix)
+--------------------------------------
+generate_trip() and get_trip() previously called ItineraryPlanningEngine
+and ValidationEngine/ExplanationEngine directly and separately:
+
+    build_result = call_engine("ItineraryPlanningEngine",
+        lambda: ItineraryPlanningEngine(db).build(request, ordered_ids), ...)
+    validation_result = call_engine("ValidationEngine",
+        lambda: ValidationEngine(db).validate(cabinet, ...), ...)
+    explanation_result = call_engine("ExplanationEngine",
+        lambda: ExplanationEngine().explain(cabinet), ...)
+
+This never ran RouteGeographyEngine, DayArchetypeEngine, or
+ScheduleRepairEngine at all -- those three engines are not imported or
+referenced anywhere in the old version of this file. The practical
+effect: every generated itinerary used ItineraryPlanningEngine's
+fixed-slot day construction with no archetype-aware theming and no
+post-planning schedule repair, which is why every day beyond day 1
+showed the same "Deeper into the park" fallback theme and identical
+06:00/13:00/16:00/18:30 time slots, and why a genuine overlap ("Hot Air
+Balloon Safari" vs "Lunch at the lodge" on Day 4) shipped to production
+unrepaired.
+
+Both routes now call ItineraryOrchestrator.generate()
+(app/engines/itinerary_v2.py) instead, which runs the full
+RulesEngine -> RouteGeographyEngine -> DayArchetypeEngine ->
+ItineraryPlanningEngine -> ScheduleRepairEngine -> ValidationEngine
+pipeline and already performs the ValidationEngine call as its own
+Stage 6 -- so validation_result is read from the orchestrator's result
+rather than called a second time here, which would have been redundant
+work against the same cabinet.
+
+ExplanationEngine is unaffected by this change -- it is still called
+directly here (both in generate_trip and get_trip) since it is not
+part of ItineraryOrchestrator's pipeline; it operates on the already-
+persisted Cabinet independently of how that Cabinet was built.
 """
 from __future__ import annotations
 
@@ -27,10 +62,8 @@ from app.api.auth import require_api_key
 from app.db.session import get_supabase_db
 from app.db.destinations import resolve_slugs_to_ids
 from app.db.models_furniture import Bench, Cabinet, Counter, Wardrobe
-from app.engines.rules import RulesEngine
 from app.engines.resilience import call_engine
-from app.engines.itinerary_v2 import ItineraryPlanningEngine
-from app.engines.validation import ValidationEngine
+from app.engines.itinerary_v2 import ItineraryOrchestrator
 from app.engines.explanation import ExplanationEngine
 from app.engines.operator_match_v2 import OperatorMatchEngine
 from app.engines.quote_engine import QuoteEngine
@@ -68,9 +101,6 @@ def _operator_summary(db: Session, tour_operator_id) -> dict:
 @router.post("/generate")
 def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
     logger.info("Executing POST /generate with payload: %s", request)
-    rules_result = RulesEngine().evaluate_rules(dict(request))
-    if rules_result.get("status") != "success" or not rules_result.get("validated", False):
-        logger.warning("Rules validation did not pass: %s", rules_result)
 
     slug_to_id = resolve_slugs_to_ids(db, request["destinations"])
     ordered_ids = [slug_to_id[s] for s in request["destinations"] if s in slug_to_id]
@@ -79,22 +109,42 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
         logger.error("Failed to resolve destination slugs for request: %s", request["destinations"])
         raise HTTPException(422, "None of the requested destinations could be resolved.")
 
-    build_result = call_engine(
-        "ItineraryPlanningEngine",
-        lambda: ItineraryPlanningEngine(db).build(request, ordered_ids),
+    # FIX: call the full pipeline via ItineraryOrchestrator instead of
+    # ItineraryPlanningEngine directly. This runs RulesEngine,
+    # RouteGeographyEngine, DayArchetypeEngine, and ScheduleRepairEngine
+    # in addition to ItineraryPlanningEngine and ValidationEngine --
+    # ValidationEngine is now called as the orchestrator's own Stage 6,
+    # so it is NOT called a second time below.
+    orchestration_result = call_engine(
+        "ItineraryOrchestrator",
+        lambda: ItineraryOrchestrator(db).generate(request, ordered_ids),
         fallback=None, db=db,
     )
-    if build_result.value is None:
-        logger.error("ItineraryPlanningEngine execution returned None")
+    if orchestration_result.value is None:
+        logger.error("ItineraryOrchestrator execution returned None")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Trip generation failed unexpectedly.")
 
-    cabinet = build_result.value.cabinet
+    generation_result = orchestration_result.value
 
-    validation_result = call_engine(
-        "ValidationEngine",
-        lambda: ValidationEngine(db).validate(cabinet, extra_warnings=build_result.value.warnings),
-        fallback={"status": "unknown", "issue_count": 0, "errors": [], "warnings": ["Validation engine unavailable"]}, db=db,
-    )
+    if generation_result.cabinet is None:
+        # RulesEngine failed fast (Stage 1) or RouteGeographyEngine
+        # could not resolve any destination (Stage 2) -- no Cabinet
+        # was ever persisted. This is a genuine request-validation
+        # failure, not a degraded/partial result, so it is surfaced
+        # as a 422 rather than returned as if a trip exists.
+        logger.warning(
+            "ItineraryOrchestrator did not produce a cabinet: %s",
+            generation_result.warnings,
+        )
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {"message": "Trip could not be generated from this request.", "warnings": generation_result.warnings},
+        )
+
+    cabinet = generation_result.cabinet
+
+    if generation_result.rules_result and not generation_result.rules_result.get("validated", True):
+        logger.warning("Rules validation did not pass: %s", generation_result.rules_result)
 
     explanation_result = call_engine(
         "ExplanationEngine",
@@ -109,12 +159,17 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
     return {
         "cabinet_id": str(cabinet.id),
         "status": cabinet.status,
-        "validation": validation_result.value,
+        "validation": generation_result.validation_result,
         "why_itinerary": explanation_result.value["facts"],
         "days": [_day_to_dict(s) for s in cabinet.shelves],
         "generation_meta": {
-            "degraded": build_result.degraded or validation_result.degraded or explanation_result.degraded,
+            "degraded": (
+                orchestration_result.degraded
+                or explanation_result.degraded
+                or bool(generation_result.warnings)
+            ),
             "unmatched_destinations": unmatched,
+            "warnings": generation_result.warnings,
         },
     }
 
@@ -339,3 +394,4 @@ def _day_to_dict(shelf) -> dict:
         "transport": shelf.armrests[0].description if shelf.armrests else None,
         "meals": [t.meal_type for t in shelf.trays if t.included],
     }
+
