@@ -463,7 +463,20 @@ class RouteGeographyEngine:
         destination_ids: list[str],
     ) -> dict[str, dict[str, Any]]:
         """
-        Load geographic metadata from travel_places.
+        Load geographic metadata from travel_places, joined against
+        physical_geography for coordinates.
+
+        FIX (real-schema alignment): travel_places itself has no
+        latitude/longitude columns in the real Supabase schema --
+        spatial data lives in the separate physical_geography table
+        (one row per destination, PostGIS geography(Point, 4326)
+        centroid column), joined here via destination_id. ST_Y/ST_X
+        extract latitude/longitude from that centroid; both are NULL
+        for a destination with no physical_geography row (a LEFT JOIN
+        is used so a missing geography row degrades to unresolved
+        coordinates rather than dropping the destination from results
+        entirely -- name/country/destination_type are still usable
+        even without a centroid).
 
         Uses CAST() rather than PostgreSQL's :: syntax so the query
         remains safe under SQLAlchemy bind-parameter processing, and
@@ -479,14 +492,16 @@ class RouteGeographyEngine:
                 text(
                     """
                     SELECT
-                        CAST(id AS text) AS destination_id,
-                        name,
-                        CAST(country AS text) AS country,
-                        CAST(destination_type AS text) AS destination_type,
-                        latitude,
-                        longitude
-                    FROM travel_places
-                    WHERE id = ANY(CAST(:destination_ids AS uuid[]))
+                        CAST(tp.id AS text) AS destination_id,
+                        tp.name,
+                        CAST(tp.country AS text) AS country,
+                        CAST(tp.destination_type AS text) AS destination_type,
+                        ST_Y(pg.centroid::geometry) AS latitude,
+                        ST_X(pg.centroid::geometry) AS longitude
+                    FROM travel_places tp
+                    LEFT JOIN physical_geography pg
+                        ON pg.destination_id = tp.id
+                    WHERE tp.id = ANY(CAST(:destination_ids AS uuid[]))
                     """
                 ),
                 {"destination_ids": list(destination_ids)},
@@ -707,13 +722,20 @@ class RouteGeographyEngine:
         """
 
         try:
+            # FIX (real-schema alignment): queries
+            # drive_times_between_destinations, not drive_times.
+            # Supabase's real drive_times table models point-to-point
+            # drives WITHIN one destination (gate -> lodge, by free-
+            # text name); this method needs inter-destination transfer
+            # data keyed by two travel_places UUIDs, which is a
+            # different table. See missing_tables.sql.
             row = self.db.execute(
                 text(
                     """
                     SELECT
                         distance_km,
                         duration_minutes_dry_season
-                    FROM drive_times
+                    FROM drive_times_between_destinations
                     WHERE from_destination_id =
                           CAST(:from_destination_id AS uuid)
                       AND to_destination_id =
@@ -757,10 +779,10 @@ class RouteGeographyEngine:
             mode="private_4x4",
             distance_km=distance_km,
             duration_minutes=duration_minutes,
-            source="drive_times",
+            source="drive_times_between_destinations",
             estimated=False,
             confidence=1.0,
-            raw={"table": "drive_times"},
+            raw={"table": "drive_times_between_destinations"},
         )
 
     # ------------------------------------------------------------------
@@ -773,8 +795,16 @@ class RouteGeographyEngine:
         to_destination_id: str,
     ) -> TransportOption | None:
         """
-        Find the fastest measured scheduled flight connecting the
-        primary gateway airports of two destinations.
+        Find the fastest measured scheduled flight connecting two
+        destinations, via either a primary gateway airport or an
+        airstrip.
+
+        FIX (real-schema alignment): doc 18's flights table allows
+        either an airport or an airstrip as origin/destination
+        (mutually exclusive, enforced by a CHECK constraint) -- a bush
+        flight from a remote airstrip is a normal safari transfer and
+        was previously invisible here, which only checked
+        origin_airport_id/destination_airport_id.
         """
 
         try:
@@ -783,19 +813,33 @@ class RouteGeographyEngine:
                     """
                     SELECT f.duration_minutes
                     FROM flights AS f
-                    WHERE f.origin_airport_id IN (
-                        SELECT da.airport_id
-                        FROM destination_airports AS da
-                        WHERE da.destination_id =
-                              CAST(:from_destination_id AS uuid)
-                          AND da.is_primary_gateway = TRUE
+                    WHERE (
+                        f.origin_airport_id IN (
+                            SELECT da.airport_id
+                            FROM destination_airports AS da
+                            WHERE da.destination_id =
+                                  CAST(:from_destination_id AS uuid)
+                              AND da.is_primary_gateway = TRUE
+                        )
+                        OR f.origin_airstrip_id IN (
+                            SELECT id FROM airstrips
+                            WHERE destination_id =
+                                  CAST(:from_destination_id AS uuid)
+                        )
                     )
-                    AND f.destination_airport_id IN (
-                        SELECT da.airport_id
-                        FROM destination_airports AS da
-                        WHERE da.destination_id =
-                              CAST(:to_destination_id AS uuid)
-                          AND da.is_primary_gateway = TRUE
+                    AND (
+                        f.destination_airport_id IN (
+                            SELECT da.airport_id
+                            FROM destination_airports AS da
+                            WHERE da.destination_id =
+                                  CAST(:to_destination_id AS uuid)
+                              AND da.is_primary_gateway = TRUE
+                        )
+                        OR f.destination_airstrip_id IN (
+                            SELECT id FROM airstrips
+                            WHERE destination_id =
+                                  CAST(:to_destination_id AS uuid)
+                        )
                     )
                     AND f.duration_minutes IS NOT NULL
                     ORDER BY f.duration_minutes ASC
@@ -971,12 +1015,12 @@ class RouteGeographyEngine:
                         visa_notes
                     FROM border_crossings
                     WHERE (
-                        country_a = :country_a
-                        AND country_b = :country_b
+                        country_a::text = :country_a
+                        AND country_b::text = :country_b
                     )
                     OR (
-                        country_a = :country_b
-                        AND country_b = :country_a
+                        country_a::text = :country_b
+                        AND country_b::text = :country_a
                     )
                     ORDER BY
                         CASE
