@@ -918,11 +918,22 @@ class ItineraryPlanningEngine:
         row = None
 
         if origin_dest_id is not None:
+            # FIX (real-schema alignment): queries
+            # drive_times_between_destinations, NOT drive_times.
+            # Supabase's existing drive_times table (see doc 18 / the
+            # production schema) models point-to-point drives WITHIN a
+            # single destination (park gate -> specific lodge, by free-
+            # text name) -- a genuinely different fact from an
+            # inter-destination transfer between two travel_places
+            # rows by UUID, which is what this method needs. See
+            # missing_tables.sql for the drive_times_between_destinations
+            # table definition and the full explanation of why these
+            # are not the same table.
             row = self.db.execute(
                 text(
                     """
                     SELECT distance_km, duration_minutes_dry_season
-                    FROM drive_times
+                    FROM drive_times_between_destinations
                     WHERE from_destination_id = CAST(:from_destination_id AS uuid)
                       AND to_destination_id = CAST(:to_destination_id AS uuid)
                     """
@@ -971,7 +982,7 @@ class ItineraryPlanningEngine:
             shelf=shelf, name="Arrival transfer", description=description,
             start_time=ARRIVAL_TRANSFER_START, duration_minutes=effective_duration,
             sort_order=order, activity_type="TRANSFER",
-            source=("drive_times" if row and duration is not None else "fallback_estimate"),
+            source=("drive_times_between_destinations" if row and duration is not None else "fallback_estimate"),
             is_fallback=not bool(row and duration is not None),
         )
         return order, end_minutes
@@ -1017,15 +1028,17 @@ class ItineraryPlanningEngine:
             to_country = meta.get(to, {}).get("country")
             is_inter_country = bool(from_country and to_country and from_country != to_country)
 
-            # FIX (schema-mismatch decision, Option A -- see schema.sql
-            # SECTION 4): directed lookup matching route_geography.py,
-            # instead of the previous undirected query that ignored
-            # which destination the traveler was coming from.
+            # FIX (real-schema alignment): queries
+            # drive_times_between_destinations, matching
+            # route_geography.py and the correction above in
+            # _destination_arrival_transfer. See that method's comment
+            # for why this is NOT the same table as Supabase's existing
+            # drive_times.
             drive_row = self.db.execute(
                 text(
                     """
                     SELECT distance_km, duration_minutes_dry_season
-                    FROM drive_times
+                    FROM drive_times_between_destinations
                     WHERE from_destination_id = CAST(:from_dest AS uuid)
                       AND to_destination_id = CAST(:to_dest AS uuid)
                     """
@@ -1043,24 +1056,45 @@ class ItineraryPlanningEngine:
                     distance_km = float(drive_row[0])
                 if drive_row[1] is not None:
                     duration_minutes = int(drive_row[1])
-                source = "drive_times"
+                source = "drive_times_between_destinations"
 
             flight_row = None
             if is_inter_country or (
                 duration_minutes is not None and duration_minutes > DRIVE_TO_FLIGHT_THRESHOLD_MINUTES
             ):
+                # FIX (real-schema alignment): doc 18's flights table
+                # allows EITHER an airport OR an airstrip as origin/
+                # destination (enforced by a CHECK constraint that
+                # exactly one of origin_airport_id/origin_airstrip_id
+                # is set, same for destination) -- a bush flight from a
+                # remote airstrip is a completely normal safari
+                # transfer and was previously invisible to this query,
+                # which only ever checked origin_airport_id /
+                # destination_airport_id. Now checks both.
                 flight_row = self.db.execute(
                     text(
                         """
                         SELECT f.duration_minutes
                         FROM flights f
-                        WHERE f.origin_airport_id IN (
-                            SELECT airport_id FROM destination_airports
-                            WHERE destination_id = CAST(:frm AS uuid) AND is_primary_gateway
+                        WHERE (
+                            f.origin_airport_id IN (
+                                SELECT airport_id FROM destination_airports
+                                WHERE destination_id = CAST(:frm AS uuid) AND is_primary_gateway
+                            )
+                            OR f.origin_airstrip_id IN (
+                                SELECT id FROM airstrips
+                                WHERE destination_id = CAST(:frm AS uuid)
+                            )
                         )
-                        AND f.destination_airport_id IN (
-                            SELECT airport_id FROM destination_airports
-                            WHERE destination_id = CAST(:to AS uuid) AND is_primary_gateway
+                        AND (
+                            f.destination_airport_id IN (
+                                SELECT airport_id FROM destination_airports
+                                WHERE destination_id = CAST(:to AS uuid) AND is_primary_gateway
+                            )
+                            OR f.destination_airstrip_id IN (
+                                SELECT id FROM airstrips
+                                WHERE destination_id = CAST(:to AS uuid)
+                            )
                         )
                         ORDER BY f.duration_minutes ASC NULLS LAST
                         LIMIT 1
@@ -1100,8 +1134,8 @@ class ItineraryPlanningEngine:
                     text(
                         """
                         SELECT id FROM border_crossings
-                        WHERE (country_a = :country_a AND country_b = :country_b)
-                           OR (country_a = :country_b AND country_b = :country_a)
+                        WHERE (country_a::text = :country_a AND country_b::text = :country_b)
+                           OR (country_a::text = :country_b AND country_b::text = :country_a)
                         ORDER BY (visa_notes IS NOT NULL) DESC
                         LIMIT 1
                         """
@@ -1255,7 +1289,6 @@ class ItineraryPlanningEngine:
             )
 
         self.db.add(headboard)
-
 
     def _populate_armrest(self, shelf: Shelf, legs: list[dict[str, Any]], destination_index: int, is_arrival_day: bool) -> None:
         if is_arrival_day and destination_index > 0 and destination_index - 1 < len(legs):
