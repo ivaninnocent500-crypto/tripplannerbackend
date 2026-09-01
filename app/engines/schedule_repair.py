@@ -12,15 +12,14 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
-from app.engines.activity_constraints import (
+from activity_constraints import (
     ActivityConstraintsEngine,
     ActivityIntensity,
     ActivityProfile,
     TimeWindow,
 )
-from app.engines.day_archetype import (
+from day_archetype import (
     DayArchetype,
-    DayArchetypeEngine,
     DayArchetypeResult,
 )
 
