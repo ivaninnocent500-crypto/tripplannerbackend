@@ -35,12 +35,13 @@ app = FastAPI(
     version="2.0.0",
 )
 
+# Broad CORS configuration to prevent connection resets on mobile & web requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ALLOWED_ORIGINS", "*").split(","),
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["X-Api-Key", "Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(health_router, prefix="/api")
@@ -59,3 +60,4 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 @app.get("/")
 def root() -> dict:
     return {"service": "Africa Travel OS API", "status": "running", "docs": "/docs"}
+
