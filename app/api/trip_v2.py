@@ -11,9 +11,44 @@ the whole request. Every call_engine(...) here passes db=db so a caught
 engine failure rolls back the session — without that, a failed insert
 mid-engine leaves the transaction aborted and every subsequent query in
 the same request (including the route's own db.commit()) fails too,
-turning one soft "degraded" result into a hard 500. RulesEngine.evaluate_rules() runs first — it currently
-always returns {"status": "success", "validated": True} (a stub), so this
-just logs a warning if that ever changes rather than blocking requests.
+turning one soft "degraded" result into a hard 500.
+
+CHANGE LOG (production incident fix)
+--------------------------------------
+generate_trip() and get_trip() previously called ItineraryPlanningEngine
+and ValidationEngine/ExplanationEngine directly and separately:
+
+    build_result = call_engine("ItineraryPlanningEngine",
+        lambda: ItineraryPlanningEngine(db).build(request, ordered_ids), ...)
+    validation_result = call_engine("ValidationEngine",
+        lambda: ValidationEngine(db).validate(cabinet, ...), ...)
+    explanation_result = call_engine("ExplanationEngine",
+        lambda: ExplanationEngine().explain(cabinet), ...)
+
+This never ran RouteGeographyEngine, DayArchetypeEngine, or
+ScheduleRepairEngine at all -- those three engines are not imported or
+referenced anywhere in the old version of this file. The practical
+effect: every generated itinerary used ItineraryPlanningEngine's
+fixed-slot day construction with no archetype-aware theming and no
+post-planning schedule repair, which is why every day beyond day 1
+showed the same "Deeper into the park" fallback theme and identical
+06:00/13:00/16:00/18:30 time slots, and why a genuine overlap ("Hot Air
+Balloon Safari" vs "Lunch at the lodge" on Day 4) shipped to production
+unrepaired.
+
+Both routes now call ItineraryOrchestrator.generate()
+(app/engines/itinerary_v2.py) instead, which runs the full
+RulesEngine -> RouteGeographyEngine -> DayArchetypeEngine ->
+ItineraryPlanningEngine -> ScheduleRepairEngine -> ValidationEngine
+pipeline and already performs the ValidationEngine call as its own
+Stage 6 -- so validation_result is read from the orchestrator's result
+rather than called a second time here, which would have been redundant
+work against the same cabinet.
+
+ExplanationEngine is unaffected by this change -- it is still called
+directly here (both in generate_trip and get_trip) since it is not
+part of ItineraryOrchestrator's pipeline; it operates on the already-
+persisted Cabinet independently of how that Cabinet was built.
 """
 from __future__ import annotations
 
@@ -27,15 +62,17 @@ from app.api.auth import require_api_key
 from app.db.session import get_supabase_db
 from app.db.destinations import resolve_slugs_to_ids
 from app.db.models_furniture import Bench, Cabinet, Counter, Wardrobe
-from app.engines.rules import RulesEngine
 from app.engines.resilience import call_engine
-from app.engines.itinerary_v2 import ItineraryPlanningEngine
-from app.engines.validation import ValidationEngine
+from app.engines.itinerary_v2 import ItineraryOrchestrator
 from app.engines.explanation import ExplanationEngine
 from app.engines.operator_match_v2 import OperatorMatchEngine
 from app.engines.quote_engine import QuoteEngine
 from app.engines.booking_engine import BookingEngine
 from app.engines.visa_engine import VisaIntelligenceEngine
+import sys
+
+# Attach to uvicorn's active handler so messages stream to Render stdout
+logger = logging.getLogger("uvicorn.error")
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/trips", tags=["trips"])
@@ -44,6 +81,7 @@ router = APIRouter(prefix="/api/trips", tags=["trips"])
 def _get_cabinet_or_404(db: Session, cabinet_id: str) -> Cabinet:
     cabinet = db.get(Cabinet, cabinet_id)
     if not cabinet:
+        logger.warning("Cabinet ID %s not found in database", cabinet_id)
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Trip not found")
     return cabinet
 
@@ -62,31 +100,51 @@ def _operator_summary(db: Session, tour_operator_id) -> dict:
 # ---------------------------------------------------------------------
 @router.post("/generate")
 def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
-    rules_result = RulesEngine().evaluate_rules(dict(request))
-    if rules_result.get("status") != "success" or not rules_result.get("validated", False):
-        logger.warning("Rules validation did not pass: %s", rules_result)
+    logger.info("Executing POST /generate with payload: %s", request)
 
     slug_to_id = resolve_slugs_to_ids(db, request["destinations"])
     ordered_ids = [slug_to_id[s] for s in request["destinations"] if s in slug_to_id]
     unmatched = [s for s in request["destinations"] if s not in slug_to_id]
     if not ordered_ids:
+        logger.error("Failed to resolve destination slugs for request: %s", request["destinations"])
         raise HTTPException(422, "None of the requested destinations could be resolved.")
 
-    build_result = call_engine(
-        "ItineraryPlanningEngine",
-        lambda: ItineraryPlanningEngine(db).build(request, ordered_ids),
+    # FIX: call the full pipeline via ItineraryOrchestrator instead of
+    # ItineraryPlanningEngine directly. This runs RulesEngine,
+    # RouteGeographyEngine, DayArchetypeEngine, and ScheduleRepairEngine
+    # in addition to ItineraryPlanningEngine and ValidationEngine --
+    # ValidationEngine is now called as the orchestrator's own Stage 6,
+    # so it is NOT called a second time below.
+    orchestration_result = call_engine(
+        "ItineraryOrchestrator",
+        lambda: ItineraryOrchestrator(db).generate(request, ordered_ids),
         fallback=None, db=db,
     )
-    if build_result.value is None:
+    if orchestration_result.value is None:
+        logger.error("ItineraryOrchestrator execution returned None")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Trip generation failed unexpectedly.")
 
-    cabinet = build_result.value.cabinet
+    generation_result = orchestration_result.value
 
-    validation_result = call_engine(
-        "ValidationEngine",
-        lambda: ValidationEngine(db).validate(cabinet, extra_warnings=build_result.value.warnings),
-        fallback={"status": "unknown", "issue_count": 0, "errors": [], "warnings": ["Validation engine unavailable"]}, db=db,
-    )
+    if generation_result.cabinet is None:
+        # RulesEngine failed fast (Stage 1) or RouteGeographyEngine
+        # could not resolve any destination (Stage 2) -- no Cabinet
+        # was ever persisted. This is a genuine request-validation
+        # failure, not a degraded/partial result, so it is surfaced
+        # as a 422 rather than returned as if a trip exists.
+        logger.warning(
+            "ItineraryOrchestrator did not produce a cabinet: %s",
+            generation_result.warnings,
+        )
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {"message": "Trip could not be generated from this request.", "warnings": generation_result.warnings},
+        )
+
+    cabinet = generation_result.cabinet
+
+    if generation_result.rules_result and not generation_result.rules_result.get("validated", True):
+        logger.warning("Rules validation did not pass: %s", generation_result.rules_result)
 
     explanation_result = call_engine(
         "ExplanationEngine",
@@ -96,21 +154,29 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
 
     db.commit()
 
+    logger.info("Trip successfully generated with Cabinet ID: %s", cabinet.id)
+
     return {
         "cabinet_id": str(cabinet.id),
         "status": cabinet.status,
-        "validation": validation_result.value,
+        "validation": generation_result.validation_result,
         "why_itinerary": explanation_result.value["facts"],
         "days": [_day_to_dict(s) for s in cabinet.shelves],
         "generation_meta": {
-            "degraded": build_result.degraded or validation_result.degraded or explanation_result.degraded,
+            "degraded": (
+                orchestration_result.degraded
+                or explanation_result.degraded
+                or bool(generation_result.warnings)
+            ),
             "unmatched_destinations": unmatched,
+            "warnings": generation_result.warnings,
         },
     }
 
 
 @router.get("/{cabinet_id}")
 def get_trip(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing GET /%s", cabinet_id)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     explanation_result = call_engine(
         "ExplanationEngine", lambda: ExplanationEngine().explain(cabinet), fallback={"facts": []}, db=db,
@@ -133,6 +199,7 @@ def get_trip(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(
 # ---------------------------------------------------------------------
 @router.post("/{cabinet_id}/match-operators")
 def match_operators(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing POST /%s/match-operators", cabinet_id)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     match_result = call_engine(
         "OperatorMatchEngine", lambda: OperatorMatchEngine(db).match(cabinet), fallback=[], db=db,
@@ -159,12 +226,14 @@ def match_operators(cabinet_id: str, db: Session = Depends(get_supabase_db), _=D
             "estimated_price_pp": float(s.estimated_price_pp) if s.estimated_price_pp else None,
         })
 
+    logger.info("Matched %d operators for cabinet: %s", len(matches), cabinet_id)
     return {"degraded": match_result.degraded, "matches": matches}
 
 
 # ---------------------------------------------------------------------
 @router.post("/{cabinet_id}/quotes/request")
 def request_quotes(cabinet_id: str, body: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing POST /%s/quotes/request with body: %s", cabinet_id, body)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     result = call_engine(
         "QuoteEngine.request_quotes",
@@ -172,11 +241,13 @@ def request_quotes(cabinet_id: str, body: dict, db: Session = Depends(get_supaba
         fallback=[], db=db,
     )
     db.commit()
+    logger.info("Quotes requested successfully for cabinet: %s", cabinet_id)
     return {"degraded": result.degraded, "benches": [str(b.id) for b in result.value], "status": "request_sent"}
 
 
 @router.get("/{cabinet_id}/quotes")
 def track_quotes(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing GET /%s/quotes", cabinet_id)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     result = call_engine(
         "QuoteEngine.tracking_summary", lambda: QuoteEngine(db).tracking_summary(cabinet),
@@ -187,6 +258,7 @@ def track_quotes(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depe
 
 @router.get("/{cabinet_id}/quotes/compare")
 def compare_quotes(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing GET /%s/quotes/compare", cabinet_id)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     result = call_engine(
         "QuoteEngine.compare", lambda: QuoteEngine(db).compare(cabinet),
@@ -207,9 +279,11 @@ def get_visa_info(
     coverage, or an explicit unverified flag — see VisaIntelligenceEngine's
     docstring for why it never guesses.
     """
+    logger.info("Executing GET /%s/visa-info for nationality: %s", cabinet_id, nationality)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     destination_countries = list(cabinet.route_countries or [])
     if not destination_countries:
+        logger.error("Cabinet %s has no route_countries recorded", cabinet_id)
         raise HTTPException(422, "This trip has no route_countries recorded — regenerate the itinerary first.")
 
     result = call_engine(
@@ -223,34 +297,42 @@ def get_visa_info(
 # ---------------------------------------------------------------------
 @router.post("/{cabinet_id}/book")
 def book_trip(cabinet_id: str, body: dict, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing POST /%s/book with body: %s", cabinet_id, body)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
     counter = db.get(Counter, body["counter_id"])
     if not counter:
+        logger.warning("Counter ID %s not found for booking", body.get("counter_id"))
         raise HTTPException(404, "Quote not found")
 
     result = call_engine(
         "BookingEngine.create_booking", lambda: BookingEngine(db).create_booking(cabinet, counter), fallback=None, db=db,
     )
     if result.value is None:
+        logger.error("BookingEngine.create_booking returned None for cabinet: %s", cabinet_id)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Booking failed unexpectedly.")
 
     db.commit()
+    logger.info("Booking created successfully with Wardrobe ID: %s", result.value.id)
     return _wardrobe_to_dict(db, result.value)
 
 
 @router.post("/bookings/{wardrobe_id}/confirm")
 def confirm_booking(wardrobe_id: str, db: Session = Depends(get_supabase_db), _=Depends(require_api_key)):
+    logger.info("Executing POST /bookings/%s/confirm", wardrobe_id)
     wardrobe = db.get(Wardrobe, wardrobe_id)
     if not wardrobe:
+        logger.warning("Wardrobe ID %s not found for confirmation", wardrobe_id)
         raise HTTPException(404, "Booking not found")
 
     result = call_engine(
         "BookingEngine.confirm_booking", lambda: BookingEngine(db).confirm_booking(wardrobe), fallback=None, db=db,
     )
     if result.value is None:
+        logger.error("BookingEngine.confirm_booking returned None for wardrobe: %s", wardrobe_id)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Confirmation failed unexpectedly.")
 
     db.commit()
+    logger.info("Booking confirmed successfully for Wardrobe ID: %s", wardrobe_id)
     return _wardrobe_to_dict(db, wardrobe)
 
 
@@ -312,3 +394,4 @@ def _day_to_dict(shelf) -> dict:
         "transport": shelf.armrests[0].description if shelf.armrests else None,
         "meals": [t.meal_type for t in shelf.trays if t.included],
     }
+
