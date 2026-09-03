@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -142,6 +142,9 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
         )
 
     cabinet = generation_result.cabinet
+
+    if request.get("nationality"):
+        cabinet.nationality = request["nationality"].upper()
 
     if generation_result.rules_result and not generation_result.rules_result.get("validated", True):
         logger.warning("Rules validation did not pass: %s", generation_result.rules_result)
@@ -270,17 +273,21 @@ def compare_quotes(cabinet_id: str, db: Session = Depends(get_supabase_db), _=De
 # ---------------------------------------------------------------------
 @router.get("/{cabinet_id}/visa-info")
 def get_visa_info(
-    cabinet_id: str, nationality: str,
+    cabinet_id: str, nationality: str | None = Query(None),
     db: Session = Depends(get_supabase_db), _=Depends(require_api_key),
 ):
     """
-    `nationality` is a required query param (a country_code, e.g. `US`).
+    Query param `nationality` is optional (e.g. `US`). When omitted, falls
+    back to `cabinet.nationality`. Returns 422 if neither is set.
     Response is always one of: a verified requirement, verified bloc
     coverage, or an explicit unverified flag — see VisaIntelligenceEngine's
     docstring for why it never guesses.
     """
-    logger.info("Executing GET /%s/visa-info for nationality: %s", cabinet_id, nationality)
     cabinet = _get_cabinet_or_404(db, cabinet_id)
+    nationality = (nationality or cabinet.nationality or "").strip().upper()
+    if not nationality:
+        raise HTTPException(422, "Nationality is required (pass query param or set on trip generation).")
+    logger.info("Executing GET /%s/visa-info for nationality: %s", cabinet_id, nationality)
     destination_countries = list(cabinet.route_countries or [])
     if not destination_countries:
         logger.error("Cabinet %s has no route_countries recorded", cabinet_id)
