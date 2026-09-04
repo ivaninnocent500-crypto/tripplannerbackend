@@ -8,6 +8,33 @@ Matches the conventions in your real app/db/models_v2.py:
     not uuid.UUID objects — same as TravelPlace.id, Lodge.id, etc.
     Mixing the two conventions in the same metadata causes comparison/
     join mismatches, so every column below follows models_v2's pattern.
+
+CHANGE LOG (this rewrite)
+--------------------------------------------------------------------
+Checked column-by-column against schema/005_multi_country_and_visa_FIXED.sql.
+Four of that migration's five additions were already present here:
+  - cabinets.route_countries, cabinets.primary_country (Cabinet)
+  - hinges.is_inter_country, hinges.requires_border_crossing,
+    hinges.border_crossing_id (Hinge)
+  - stools.country_coverage_pct, stools.score_provenance,
+    stools.has_placeholder_subscores, stools.confidence_pct (Stool)
+  - drawers.source, drawers.category, drawers.destination_id,
+    drawers.is_fallback (Drawer)
+No changes needed for any of those — confirmed already correct.
+
+ONE genuine gap found and fixed: migration 005 also added
+`cabinets.traveler_nationality world_country_code` to the real
+database, but this ORM class had no matching attribute. Every
+`cabinet.traveler_nationality` reference in the rewritten
+app/api/trip_v2.py would raise AttributeError without this — the DB
+column existing doesn't make Python aware of it; SQLAlchemy only
+reads/writes columns explicitly declared on the class. Added below as
+plain `Text` (not a Postgres-enum-backed type on the ORM side) — the
+DB enforces the ISO-2 format via world_country_code's own
+`^[A-Z]{2}$` CHECK constraint; the ORM column only needs to pass a
+string through to it.
+
+Nothing else in this file changed from what you sent.
 """
 from __future__ import annotations
 
@@ -21,7 +48,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
-from app.db.models_v2 import Base  # Base lives in models_v2.py in this repo
+from app.db.models_v2 import Base # Base lives in models_v2.py in this repo
 
 
 def gen_uuid() -> str:
@@ -51,6 +78,13 @@ class Cabinet(Base):
     status = Column(Text, nullable=False, default="draft")
     route_countries = Column(ARRAY(Text), nullable=False, default=list)
     primary_country = Column(Text)
+    # NEW — matches cabinets.traveler_nationality (world_country_code
+    # domain) added by migration 005. Plain Text on the ORM side; the
+    # DB's world_country_code CHECK constraint enforces the ISO-2
+    # format. Written by app/api/trip_v2.py's generate_trip() from the
+    # request's "traveler_nationality" key; read by get_visa_info() as
+    # the fallback when no ?nationality= query param is supplied.
+    traveler_nationality = Column(Text)
     start_date = Column(Date)
     end_date = Column(Date)
     estimated_budget_low = Column(Numeric(10, 2))
@@ -297,3 +331,4 @@ class Mirror(Base):
     message = Column(Text, nullable=False)
     sent = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
