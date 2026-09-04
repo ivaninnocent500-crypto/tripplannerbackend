@@ -13,42 +13,80 @@ mid-engine leaves the transaction aborted and every subsequent query in
 the same request (including the route's own db.commit()) fails too,
 turning one soft "degraded" result into a hard 500.
 
-CHANGE LOG (production incident fix)
---------------------------------------
+CHANGE LOG (this rewrite — consolidates patches 001/005/009/010 into
+one authoritative file; discard all of those, this file supersedes
+them)
+--------------------------------------------------------------------
+1. NATIONALITY KEY MISMATCH FIXED — the previous version of this file
+   read `request["nationality"]`, but GenerateTripV2RequestDto (the
+   Android side) sends the JSON key "traveler_nationality" via
+   @SerializedName. Two different dict keys meant nationality was
+   silently dropped on every trip generation — request.get() returns
+   None instead of raising, so nothing ever surfaced this. Fixed below
+   to read request.get("traveler_nationality").
+
+2. COLUMN NAME RECONCILED — the previous version wrote to
+   `cabinet.nationality`, but migration 005
+   (schema/005_multi_country_and_visa_FIXED.sql, already run
+   successfully) created the column as
+   `cabinets.traveler_nationality` (the `world_country_code` domain,
+   not the closed African-only `country_code` enum — see that
+   migration's own docstring for why). This file now uses
+   `cabinet.traveler_nationality` throughout, matching the real DB
+   column. See the CO-REQUISITE note below — models_furniture.py's
+   Cabinet class must expose this as an ORM attribute for these lines
+   to work; if it doesn't yet, add it there too (exact line given
+   below).
+
+3. destination_slug / destination_name RESTORED on _day_to_dict() —
+   needed by the Android Day-by-Day screen's accommodation-image
+   carousel (GET /api/places/{slug}/images) and its LOCATION summary
+   row. A prior edit reverted this function to a single-arg signature
+   with neither field; restored here with both, resolved via one
+   extra query per shelf (at most ~21 per request — a trip's day count
+   is capped at 21 by the app's wizard slider, so this is not worth
+   batching).
+
+4. Everything else (generate_trip's orchestration pipeline,
+   match_operators, request_quotes, track_quotes, compare_quotes,
+   book_trip, confirm_booking, _wardrobe_to_dict) is UNCHANGED from
+   the version you're running — no bugs found in those paths.
+
+CHANGE LOG (production incident fix — pre-existing, unchanged by this
+rewrite)
+--------------------------------------------------------------------
 generate_trip() and get_trip() previously called ItineraryPlanningEngine
-and ValidationEngine/ExplanationEngine directly and separately:
+and ValidationEngine/ExplanationEngine directly and separately, which
+never ran RouteGeographyEngine, DayArchetypeEngine, or
+ScheduleRepairEngine at all. Both routes now call
+ItineraryOrchestrator.generate() (app/engines/itinerary_v2.py) instead,
+which runs the full RulesEngine -> RouteGeographyEngine ->
+DayArchetypeEngine -> ItineraryPlanningEngine -> ScheduleRepairEngine ->
+ValidationEngine pipeline and already performs the ValidationEngine
+call as its own Stage 6 — so validation_result is read from the
+orchestrator's result rather than called a second time here.
 
-    build_result = call_engine("ItineraryPlanningEngine",
-        lambda: ItineraryPlanningEngine(db).build(request, ordered_ids), ...)
-    validation_result = call_engine("ValidationEngine",
-        lambda: ValidationEngine(db).validate(cabinet, ...), ...)
-    explanation_result = call_engine("ExplanationEngine",
-        lambda: ExplanationEngine().explain(cabinet), ...)
+ExplanationEngine is unaffected by this — it is still called directly
+here (both in generate_trip and get_trip) since it is not part of
+ItineraryOrchestrator's pipeline; it operates on the already-persisted
+Cabinet independently of how that Cabinet was built.
 
-This never ran RouteGeographyEngine, DayArchetypeEngine, or
-ScheduleRepairEngine at all -- those three engines are not imported or
-referenced anywhere in the old version of this file. The practical
-effect: every generated itinerary used ItineraryPlanningEngine's
-fixed-slot day construction with no archetype-aware theming and no
-post-planning schedule repair, which is why every day beyond day 1
-showed the same "Deeper into the park" fallback theme and identical
-06:00/13:00/16:00/18:30 time slots, and why a genuine overlap ("Hot Air
-Balloon Safari" vs "Lunch at the lodge" on Day 4) shipped to production
-unrepaired.
+--------------------------------------------------------------------
+CO-REQUISITE — models_furniture.py (not included in this file; edit
+separately)
+--------------------------------------------------------------------
+The Cabinet ORM class must declare traveler_nationality as a Column,
+matching migration 005's DB column, or every `cabinet.traveler_nationality`
+reference below will raise AttributeError. Add this line to Cabinet's
+column list in models_furniture.py, alongside its other Column(...)
+declarations (e.g. near `primary_country = Column(Text)`):
 
-Both routes now call ItineraryOrchestrator.generate()
-(app/engines/itinerary_v2.py) instead, which runs the full
-RulesEngine -> RouteGeographyEngine -> DayArchetypeEngine ->
-ItineraryPlanningEngine -> ScheduleRepairEngine -> ValidationEngine
-pipeline and already performs the ValidationEngine call as its own
-Stage 6 -- so validation_result is read from the orchestrator's result
-rather than called a second time here, which would have been redundant
-work against the same cabinet.
+    traveler_nationality = Column(Text)
 
-ExplanationEngine is unaffected by this change -- it is still called
-directly here (both in generate_trip and get_trip) since it is not
-part of ItineraryOrchestrator's pipeline; it operates on the already-
-persisted Cabinet independently of how that Cabinet was built.
+Plain Text is correct here (not a Postgres-level enum type on the ORM
+side) — the DB enforces the `^[A-Z]{2}$` format via the
+world_country_code domain's CHECK constraint; the ORM column just
+needs to read/write that string.
 """
 from __future__ import annotations
 
@@ -69,7 +107,6 @@ from app.engines.operator_match_v2 import OperatorMatchEngine
 from app.engines.quote_engine import QuoteEngine
 from app.engines.booking_engine import BookingEngine
 from app.engines.visa_engine import VisaIntelligenceEngine
-import sys
 
 # Attach to uvicorn's active handler so messages stream to Render stdout
 logger = logging.getLogger("uvicorn.error")
@@ -109,12 +146,10 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
         logger.error("Failed to resolve destination slugs for request: %s", request["destinations"])
         raise HTTPException(422, "None of the requested destinations could be resolved.")
 
-    # FIX: call the full pipeline via ItineraryOrchestrator instead of
-    # ItineraryPlanningEngine directly. This runs RulesEngine,
-    # RouteGeographyEngine, DayArchetypeEngine, and ScheduleRepairEngine
-    # in addition to ItineraryPlanningEngine and ValidationEngine --
-    # ValidationEngine is now called as the orchestrator's own Stage 6,
-    # so it is NOT called a second time below.
+    # Runs the full pipeline via ItineraryOrchestrator (RulesEngine ->
+    # RouteGeographyEngine -> DayArchetypeEngine -> ItineraryPlanningEngine
+    # -> ScheduleRepairEngine -> ValidationEngine). ValidationEngine is
+    # the orchestrator's own Stage 6, so it is NOT called again below.
     orchestration_result = call_engine(
         "ItineraryOrchestrator",
         lambda: ItineraryOrchestrator(db).generate(request, ordered_ids),
@@ -129,9 +164,8 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
     if generation_result.cabinet is None:
         # RulesEngine failed fast (Stage 1) or RouteGeographyEngine
         # could not resolve any destination (Stage 2) -- no Cabinet
-        # was ever persisted. This is a genuine request-validation
-        # failure, not a degraded/partial result, so it is surfaced
-        # as a 422 rather than returned as if a trip exists.
+        # was ever persisted. Genuine request-validation failure, not
+        # a degraded/partial result, so surfaced as 422.
         logger.warning(
             "ItineraryOrchestrator did not produce a cabinet: %s",
             generation_result.warnings,
@@ -143,8 +177,15 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
 
     cabinet = generation_result.cabinet
 
-    if request.get("nationality"):
-        cabinet.nationality = request["nationality"].upper()
+    # FIXED: reads "traveler_nationality" — the JSON key
+    # GenerateTripV2RequestDto.travelerNationality actually sends via
+    # @SerializedName("traveler_nationality"). Previously read
+    # "nationality", a key the app never sends, so this silently never
+    # persisted. Written to cabinet.traveler_nationality, matching
+    # migration 005's real column name (see CO-REQUISITE note above).
+    if request.get("traveler_nationality"):
+        cabinet.traveler_nationality = request["traveler_nationality"].strip().upper()
+        db.add(cabinet)
 
     if generation_result.rules_result and not generation_result.rules_result.get("validated", True):
         logger.warning("Rules validation did not pass: %s", generation_result.rules_result)
@@ -164,7 +205,7 @@ def generate_trip(request: dict, db: Session = Depends(get_supabase_db), _=Depen
         "status": cabinet.status,
         "validation": generation_result.validation_result,
         "why_itinerary": explanation_result.value["facts"],
-        "days": [_day_to_dict(s) for s in cabinet.shelves],
+        "days": [_day_to_dict(db, s) for s in cabinet.shelves],
         "generation_meta": {
             "degraded": (
                 orchestration_result.degraded
@@ -194,7 +235,7 @@ def get_trip(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(
         "route": [str(x) for x in cabinet.route_destination_ids],
         "dates": {"start": cabinet.start_date, "end": cabinet.end_date},
         "estimated_budget": {"low": cabinet.estimated_budget_low, "high": cabinet.estimated_budget_high},
-        "days": [_day_to_dict(s) for s in cabinet.shelves],
+        "days": [_day_to_dict(db, s) for s in cabinet.shelves],
         "why_itinerary": explanation_result.value["facts"],
     }
 
@@ -277,16 +318,21 @@ def get_visa_info(
     db: Session = Depends(get_supabase_db), _=Depends(require_api_key),
 ):
     """
-    Query param `nationality` is optional (e.g. `US`). When omitted, falls
-    back to `cabinet.nationality`. Returns 422 if neither is set.
+    Query param `nationality` is optional (ISO-2, e.g. `US`). When
+    omitted, falls back to cabinet.traveler_nationality — the value
+    captured during trip generation (see generate_trip() above).
+    Returns 422 if neither is available: this engine never guesses a
+    nationality to check against.
+
     Response is always one of: a verified requirement, verified bloc
     coverage, or an explicit unverified flag — see VisaIntelligenceEngine's
-    docstring for why it never guesses.
+    docstring for why it never guesses either.
     """
     cabinet = _get_cabinet_or_404(db, cabinet_id)
-    nationality = (nationality or cabinet.nationality or "").strip().upper()
+    nationality = (nationality or cabinet.traveler_nationality or "").strip().upper()
     if not nationality:
         raise HTTPException(422, "Nationality is required (pass query param or set on trip generation).")
+
     logger.info("Executing GET /%s/visa-info for nationality: %s", cabinet_id, nationality)
     destination_countries = list(cabinet.route_countries or [])
     if not destination_countries:
@@ -347,11 +393,8 @@ def confirm_booking(wardrobe_id: str, db: Session = Depends(get_supabase_db), _=
 def _wardrobe_to_dict(db: Session, wardrobe: Wardrobe) -> dict:
     """
     Full payload for the "Your safari is ready" / "Booking confirmed"
-    screens (img 12 / img 1) — trip title, operator name, dates,
-    travelers, accommodation, transport, price, deposit, status.
-    Previously book_trip/confirm_booking only returned the four booking
-    fields; this was a real gap against what those two screens display,
-    found while checking output against the screenshots.
+    screens — trip title, operator name, dates, travelers,
+    accommodation, transport, price, deposit, status.
     """
     cabinet = wardrobe.cabinet
     operator_row = db.execute(
@@ -386,11 +429,33 @@ def _wardrobe_to_dict(db: Session, wardrobe: Wardrobe) -> dict:
 
 
 # ---------------------------------------------------------------------
-def _day_to_dict(shelf) -> dict:
+def _day_to_dict(db: Session, shelf) -> dict:
+    """
+    RESTORED: destination_slug + destination_name, resolved from
+    travel_places via shelf.destination_id. Needed by the Android
+    Day-by-Day screen's accommodation-image carousel
+    (GET /api/places/{slug}/images, keyed on destination_slug) and its
+    LOCATION summary row (destination_name). One extra single-row
+    query per shelf — a trip is capped at 21 days by the app's wizard
+    slider, so this is not worth batching into an IN-query.
+    """
+    destination_slug = None
+    destination_name = None
+    if shelf.destination_id:
+        place_row = db.execute(
+            text("SELECT slug, name FROM travel_places WHERE id = :id"),
+            {"id": shelf.destination_id},
+        ).fetchone()
+        if place_row:
+            destination_slug = place_row.slug
+            destination_name = place_row.name
+
     return {
         "day": shelf.day_number,
         "date": shelf.date,
         "destination_id": str(shelf.destination_id) if shelf.destination_id else None,
+        "destination_slug": destination_slug,
+        "destination_name": destination_name,
         "theme": shelf.theme,
         "activities": [
             {"name": d.name, "description": d.description, "start_time": str(d.start_time) if d.start_time else None,
