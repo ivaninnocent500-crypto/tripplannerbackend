@@ -28,26 +28,39 @@ async def get_place_images(slug: str):
         raise HTTPException(status_code=500, detail="Database client unconfigured")
 
     try:
-        # Join destination_images with destinations table using slug directly
-        res = (
-            supabase.table("destination_images")
-            .select("image_url, caption, destinations!inner(slug)")
-            .eq("destinations.slug", slug)
-            .limit(5)
+        rows = []
+
+        # 1. Look up destination by slug
+        dest_res = (
+            supabase.table("destinations")
+            .select("id")
+            .eq("slug", slug)
             .execute()
         )
 
-        # Fallback: If no images match slug join, fetch first available images
-        rows = res.data if res.data else []
+        # 2. Fetch images by destination_id if matched
+        if dest_res.data:
+            dest_id = dest_res.data[0]["id"]
+            img_res = (
+                supabase.table("destination_images")
+                .select("image_url, caption")
+                .eq("destination_id", dest_id)
+                .limit(5)
+                .execute()
+            )
+            rows = img_res.data if img_res.data else []
+
+        # 3. Fallback: If no images matched, pull any available destination images
         if not rows:
             fallback_res = (
                 supabase.table("destination_images")
                 .select("image_url, caption")
-                .limit(3)
+                .limit(5)
                 .execute()
             )
             rows = fallback_res.data if fallback_res.data else []
 
+        # 4. Map output DTO
         return [
             PlaceImageDto(
                 url=row["image_url"],
