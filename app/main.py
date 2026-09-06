@@ -19,6 +19,7 @@ import os
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from app.api.places import router as places_router # <-- 1. Import places router
 
 from app.api.health import router as health_router
 from app.api.trip_v2 import router as trip_router
@@ -46,6 +47,7 @@ app.add_middleware(
 
 app.include_router(health_router, prefix="/api")
 app.include_router(trip_router)
+app.include_router(places_router) # <-- 2. Mount places router
 
 
 @app.exception_handler(Exception)
@@ -60,4 +62,3 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 @app.get("/")
 def root() -> dict:
     return {"service": "Africa Travel OS API", "status": "running", "docs": "/docs"}
-
