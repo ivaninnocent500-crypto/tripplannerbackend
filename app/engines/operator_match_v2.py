@@ -92,7 +92,7 @@ class OperatorMatchEngine:
                    t.rating, t.review_count, t.headquarters_country
             from tour_operators t
             join destination_tour_operators dto on dto.tour_operator_id = t.id
-            where dto.destination_id = any(:route) and t.verification_status = 'verified'
+            where dto.destination_id::text = any(:route) and t.verification_status = 'verified'
         """), {"route": route}).fetchall()
 
         op_ids = [c[0] for c in candidates]
@@ -184,7 +184,7 @@ class OperatorMatchEngine:
         if not route:
             return []
         rows = self.db.execute(
-            text("select distinct country::text from travel_places where id = any(:ids)"), {"ids": route},
+            text("select distinct country::text from travel_places where id::text = any(:ids)"), {"ids": route},
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -192,7 +192,7 @@ class OperatorMatchEngine:
         if not route:
             return 0
         n = self.db.execute(text(
-            "select count(*) from destination_tour_operators where tour_operator_id = :op_id and destination_id = any(:route)"
+            "select count(*) from destination_tour_operators where tour_operator_id = :op_id and destination_id::text = any(:route)"
         ), {"op_id": op_id, "route": route}).scalar() or 0
         return int(100 * n / max(1, len(route)))
 
