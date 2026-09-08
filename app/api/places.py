@@ -3,7 +3,7 @@ import re
 import logging
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
 logger = logging.getLogger(__name__)
@@ -16,10 +16,35 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SU
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 
+# ============================================================================
+# DTO — must mirror com.tta.africasafariguide.data.PlaceImageDto exactly.
+#
+# Kotlin side (Gson @SerializedName):
+# id: String (non-null)
+# image_url -> imageUrl: String (non-null)
+# image_category -> imageCategory: String (non-null)
+# caption: String? (nullable)
+# display_order -> displayOrder: Int (non-null)
+# width_px -> widthPx: Int? (nullable)
+# height_px -> heightPx: Int? (nullable)
+# lodge_id -> lodgeId: String? (nullable)
+#
+# by_alias=True on the response ensures FastAPI/Pydantic serializes using
+# these snake_case keys instead of the Python field names.
+# ============================================================================
+
 class PlaceImageDto(BaseModel):
-    url: str
+    id: str
+    image_url: str = Field(alias="image_url")
+    image_category: str = Field(alias="image_category")
     caption: Optional[str] = None
-    order: int = 0
+    display_order: int = Field(alias="display_order", default=0)
+    width_px: Optional[int] = Field(alias="width_px", default=None)
+    height_px: Optional[int] = Field(alias="height_px", default=None)
+    lodge_id: Optional[str] = Field(alias="lodge_id", default=None)
+
+    class Config:
+        populate_by_name = True
 
 
 def _normalize_slug(text: str) -> str:
@@ -84,38 +109,70 @@ async def get_place_images(slug: str):
                 .execute()
             )
 
-        # 2. Fetch destination_images by destination_id
+        # 2. Fetch destination_images by destination_id.
+        # Select every column the Kotlin PlaceImageDto needs — previously
+        # this only selected image_url/caption, silently dropping id,
+        # image_category, display_order, width_px, height_px, lodge_id.
         if dest_res.data:
             dest_id = dest_res.data[0]["id"]
             img_res = (
                 supabase.table("destination_images")
-                .select("image_url, caption")
+                .select(
+                    "id, image_url, image_category, caption, display_order, "
+                    "width_px, height_px, lodge_id"
+                )
                 .eq("destination_id", dest_id)
+                .order("display_order")
                 .limit(5)
                 .execute()
             )
             rows = img_res.data if img_res.data else []
 
-        # 3. Fallback: Pull active default images if no images matched destination
+        # 3. No same-destination match found — return an empty list rather
+        # than an unrelated destination's photos. Returning arbitrary
+        # images here would mislead the user into thinking they belong
+        # to their chosen destination. The Kotlin ViewModel already
+        # treats a 404/empty Tier-1 result as "fall back to Supabase",
+        # so returning [] here is the correct, honest signal.
         if not rows:
-            fallback_res = (
-                supabase.table("destination_images")
-                .select("image_url, caption")
-                .limit(5)
-                .execute()
+            logger.info(
+                "get_place_images(%s): no destination match, "
+                "returning empty list instead of unrelated fallback images",
+                slug,
             )
-            rows = fallback_res.data if fallback_res.data else []
+            return []
 
-        # 4. Construct response DTO
-        results = [
-            PlaceImageDto(
-                url=row["image_url"],
-                caption=row.get("caption"),
-                order=idx,
+        # 4. Construct response DTO, matching every field the Kotlin
+        # data class requires. Rows missing a hard-required field
+        # (id, image_url, image_category) are skipped rather than
+        # sent malformed, since Gson will fail to deserialize a
+        # non-null field that's missing/null.
+        results: List[PlaceImageDto] = []
+        for row in rows:
+            image_url = row.get("image_url")
+            row_id = row.get("id")
+
+            if not image_url or not row_id:
+                logger.warning(
+                    "get_place_images(%s): skipping row missing "
+                    "id/image_url: %s",
+                    slug,
+                    row,
+                )
+                continue
+
+            results.append(
+                PlaceImageDto(
+                    id=str(row_id),
+                    image_url=image_url,
+                    image_category=row.get("image_category") or "accommodation",
+                    caption=row.get("caption"),
+                    display_order=row.get("display_order") or 0,
+                    width_px=row.get("width_px"),
+                    height_px=row.get("height_px"),
+                    lodge_id=row.get("lodge_id"),
+                )
             )
-            for idx, row in enumerate(rows)
-            if row.get("image_url")
-        ]
 
         return results
 
