@@ -16,23 +16,6 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SU
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 
-# ============================================================================
-# DTO — must mirror com.tta.africasafariguide.data.PlaceImageDto exactly.
-#
-# Kotlin side (Gson @SerializedName):
-# id: String (non-null)
-# image_url -> imageUrl: String (non-null)
-# image_category -> imageCategory: String (non-null)
-# caption: String? (nullable)
-# display_order -> displayOrder: Int (non-null)
-# width_px -> widthPx: Int? (nullable)
-# height_px -> heightPx: Int? (nullable)
-# lodge_id -> lodgeId: String? (nullable)
-#
-# by_alias=True on the response ensures FastAPI/Pydantic serializes using
-# these snake_case keys instead of the Python field names.
-# ============================================================================
-
 class PlaceImageDto(BaseModel):
     id: str
     image_url: str = Field(alias="image_url")
@@ -48,7 +31,6 @@ class PlaceImageDto(BaseModel):
 
 
 def _normalize_slug(text: str) -> str:
-    """Normalize slugs for tolerant Supabase lookup."""
     if not text:
         return ""
     text = text.lower().replace("_", "-").replace(" ", "-")
@@ -62,9 +44,11 @@ async def list_places(published_only: bool = False):
     if not supabase:
         return []
     try:
-        query = supabase.table("destinations").select("id, name, slug")
+        # FIX 1: Point to travel_places table
+        query = supabase.table("travel_places").select("id, name, slug")
         if published_only:
-            query = query.eq("published", True)
+            # FIX 2: Correct column name from 'published' to 'is_published'
+            query = query.eq("is_published", True)
         res = query.execute()
         return res.data if res.data else []
     except Exception as e:
@@ -82,9 +66,10 @@ async def get_place_images(slug: str):
         normalized_slug = _normalize_slug(slug)
         rows = []
 
+        # FIX 3: Point all destination lookups to 'travel_places' instead of 'destinations'
         # 1. Exact match lookup on destination slug
         dest_res = (
-            supabase.table("destinations")
+            supabase.table("travel_places")
             .select("id")
             .eq("slug", slug)
             .execute()
@@ -93,7 +78,7 @@ async def get_place_images(slug: str):
         # 1b. Normalized slug lookup fallback
         if not dest_res.data and normalized_slug != slug:
             dest_res = (
-                supabase.table("destinations")
+                supabase.table("travel_places")
                 .select("id")
                 .eq("slug", normalized_slug)
                 .execute()
@@ -103,16 +88,13 @@ async def get_place_images(slug: str):
         if not dest_res.data:
             clean_term = slug.replace("-", " ")
             dest_res = (
-                supabase.table("destinations")
+                supabase.table("travel_places")
                 .select("id")
                 .ilike("name", f"%{clean_term}%")
                 .execute()
             )
 
-        # 2. Fetch destination_images by destination_id.
-        # Select every column the Kotlin PlaceImageDto needs — previously
-        # this only selected image_url/caption, silently dropping id,
-        # image_category, display_order, width_px, height_px, lodge_id.
+        # 2. Fetch destination_images by destination_id
         if dest_res.data:
             dest_id = dest_res.data[0]["id"]
             img_res = (
@@ -128,25 +110,13 @@ async def get_place_images(slug: str):
             )
             rows = img_res.data if img_res.data else []
 
-        # 3. No same-destination match found — return an empty list rather
-        # than an unrelated destination's photos. Returning arbitrary
-        # images here would mislead the user into thinking they belong
-        # to their chosen destination. The Kotlin ViewModel already
-        # treats a 404/empty Tier-1 result as "fall back to Supabase",
-        # so returning [] here is the correct, honest signal.
         if not rows:
             logger.info(
-                "get_place_images(%s): no destination match, "
-                "returning empty list instead of unrelated fallback images",
+                "get_place_images(%s): no destination match in travel_places",
                 slug,
             )
             return []
 
-        # 4. Construct response DTO, matching every field the Kotlin
-        # data class requires. Rows missing a hard-required field
-        # (id, image_url, image_category) are skipped rather than
-        # sent malformed, since Gson will fail to deserialize a
-        # non-null field that's missing/null.
         results: List[PlaceImageDto] = []
         for row in rows:
             image_url = row.get("image_url")
@@ -154,8 +124,7 @@ async def get_place_images(slug: str):
 
             if not image_url or not row_id:
                 logger.warning(
-                    "get_place_images(%s): skipping row missing "
-                    "id/image_url: %s",
+                    "get_place_images(%s): skipping row missing id/image_url: %s",
                     slug,
                     row,
                 )
@@ -165,7 +134,7 @@ async def get_place_images(slug: str):
                 PlaceImageDto(
                     id=str(row_id),
                     image_url=image_url,
-                    image_category=row.get("image_category") or "accommodation",
+                    image_category=row.get("image_category") or "destination",
                     caption=row.get("caption"),
                     display_order=row.get("display_order") or 0,
                     width_px=row.get("width_px"),
