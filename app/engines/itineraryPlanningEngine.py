@@ -33,6 +33,48 @@ CHANGE LOG (audit-confirmed fixes)
    arithmetic comparisons) now branches on None explicitly and
    produces an honest "duration unavailable" message instead of
    "approximately None min" or a TypeError.
+
+3. Arrival-day morning-slot overlap (THIS REWRITE).
+
+   _populate_drawers previously scheduled a "morning" activity via
+   _default_start_for() on EVERY non-first, non-last day -- including
+   an arrival day at a new destination, where the day already begins
+   with an "Arrival transfer" drawer computed by
+   _destination_arrival_transfer(). _default_start_for() has no
+   awareness of that transfer: for a game_drive-category activity it
+   unconditionally returns 06:00, regardless of what time the arrival
+   transfer starts or ends. The result was itineraries like:
+
+       Arrival transfer 14:00
+       Crater Floor Game Drive 06:00 <- same calendar day, BEFORE
+                                             the arrival transfer that
+                                             was just scheduled
+
+   which is exactly the class of conflict ValidationEngine's
+   _check_time_overlaps() is built to catch (see validation.py) -- but
+   catching it after the fact and never avoiding it at construction
+   time meant a broken itinerary could still reach the UI whenever
+   that Footstool error wasn't (or isn't yet) surfaced end-to-end.
+
+   Fix: an arrival day has no independent "morning slot" at all -- the
+   transfer itself occupies the morning. _populate_drawers now skips
+   the morning-activity block entirely when is_arrival_day is True,
+   consuming nothing from the destination's activity pool for that
+   slot, and proceeds straight to lunch -> afternoon using the same
+   transfer_end_minutes-aware logic that already existed for the
+   afternoon slot (see AFTERNOON_SLOT_DEFAULT_START handling below,
+   unchanged from the previous version). This mirrors how real safari
+   operators structure an arrival day: "depending on when you arrive,
+   your first day may include a shortened afternoon game drive... or
+   simply time to settle in" -- never an activity slot that predates
+   the transfer that puts the traveler at the destination in the first
+   place.
+
+   Because the morning activity is skipped rather than consumed and
+   discarded, `cursor[dest_id]` is NOT advanced for that slot -- the
+   activity that would have been used stays at the front of the pool
+   and is used for the afternoon slot instead, so no seeded activity
+   is silently dropped from the destination's pool.
 """
 
 from __future__ import annotations
@@ -86,6 +128,13 @@ BORDER_BUFFER_NIGHTS = 1
 # that couldn't actually happen.
 # - An unknown (None) transfer duration falls back to the
 # conservative fixed default rather than being treated as zero.
+#
+# NEW IN THIS REWRITE: this same transfer-awareness now also governs
+# whether a MORNING slot exists at all on an arrival day -- see
+# _populate_drawers' is_arrival_day branch. There is no equivalent
+# "MORNING_SLOT_DEFAULT_START" constant because an arrival day never
+# has an independent morning slot to default; the transfer occupies
+# it unconditionally.
 ARRIVAL_TRANSFER_START = dt_time(14, 0)
 AFTERNOON_SLOT_DEFAULT_START = dt_time(16, 0)
 EVENING_SLOT_START = dt_time(18, 30)
@@ -468,12 +517,11 @@ class ItineraryPlanningEngine:
                 # a later flush/lazy-reload to make this shelf visible
                 # via cabinet.shelves. Setting the raw FK column alone
                 # does not update the backref'd collection in memory --
-                # doc 2's Cabinet.shelves relationship uses
-                # backref="cabinet", so assigning shelf.cabinet here
-                # keeps cabinet.shelves correct immediately for any
-                # caller that reads it right after build() returns in
-                # the same transaction (itinerary_v2.py's orchestrator
-                # now does exactly this).
+                # Cabinet.shelves relationship uses backref="cabinet",
+                # so assigning shelf.cabinet here keeps cabinet.shelves
+                # correct immediately for any caller that reads it
+                # right after build() returns in the same transaction
+                # (itinerary_v2.py's orchestrator does exactly this).
                 if hasattr(shelf, "cabinet"):
                     shelf.cabinet = cabinet
                 elif shelf not in cabinet.shelves:
@@ -741,7 +789,33 @@ class ItineraryPlanningEngine:
         else:
             transfer_end_minutes = None
 
-        morning = self._consume_next_activity(pool=pool, cursor=cursor, dest_id=dest_id)
+        # --- FIX: no independent morning slot on an arrival day ---
+        #
+        # Previously, `morning` was always populated here regardless
+        # of is_arrival_day, using _default_start_for(category) --
+        # which for a game_drive-category activity unconditionally
+        # returns 06:00, with no awareness that an "Arrival transfer"
+        # drawer was just scheduled for this same day (potentially
+        # starting at 14:00). That produced itineraries where a
+        # same-day activity was shown starting BEFORE the transfer
+        # that gets the traveler to the destination -- exactly the
+        # overlap ValidationEngine's _check_time_overlaps() exists to
+        # catch, but never avoided at construction time.
+        #
+        # An arrival day has no independent morning slot: the transfer
+        # occupies the morning by definition. So on an arrival day we
+        # skip the morning-activity block entirely -- `morning` stays
+        # None and NOTHING is consumed from `pool`/`cursor` for it.
+        # The activity that would have filled this slot remains at
+        # the front of the pool and is used for the afternoon slot
+        # below instead, so no seeded activity is silently dropped.
+        #
+        # On a non-arrival day, behavior is completely unchanged from
+        # before.
+        if is_arrival_day:
+            morning = None
+        else:
+            morning = self._consume_next_activity(pool=pool, cursor=cursor, dest_id=dest_id)
 
         if morning:
             first_activity_id = morning["id"]
@@ -751,7 +825,17 @@ class ItineraryPlanningEngine:
                 sort_order=order, activity_type="EXPERIENCE", activity_id=morning["id"],
                 source="activities_table",
             )
-        else:
+            order += 1
+            self._add_drawer(
+                shelf=shelf, name="Lunch at the lodge", description=None,
+                start_time=dt_time(13, 0), duration_minutes=60, sort_order=order,
+                activity_type="MEAL", source="hardcoded_meal",
+            )
+            order += 1
+        elif not is_arrival_day:
+            # Non-arrival day with an exhausted pool: keep the
+            # previous fallback behavior exactly as it was (fallback
+            # drawer + lunch), unchanged.
             title, description = _fallback_drawer_text(dest_type, fallback_counters[dest_id])
             fallback_counters[dest_id] += 1
             self._add_drawer(
@@ -764,14 +848,28 @@ class ItineraryPlanningEngine:
                 "Day %s at %s: activity pool exhausted (morning slot); fallback used.",
                 day_number, dest_id,
             )
-
-        order += 1
-        self._add_drawer(
-            shelf=shelf, name="Lunch at the lodge", description=None,
-            start_time=dt_time(13, 0), duration_minutes=60, sort_order=order,
-            activity_type="MEAL", source="hardcoded_meal",
-        )
-        order += 1
+            order += 1
+            self._add_drawer(
+                shelf=shelf, name="Lunch at the lodge", description=None,
+                start_time=dt_time(13, 0), duration_minutes=60, sort_order=order,
+                activity_type="MEAL", source="hardcoded_meal",
+            )
+            order += 1
+        else:
+            # Arrival day: no morning activity drawer, but lunch is
+            # still served -- it's scheduled relative to the fixed
+            # LUNCH time regardless of the transfer, same as before.
+            # (If the transfer runs long enough to swallow lunch too,
+            # ValidationEngine's overlap check will still catch that
+            # as a genuine conflict -- that is a different, larger
+            # problem than this fix addresses, and correctly remains
+            # visible rather than silently patched over here.)
+            self._add_drawer(
+                shelf=shelf, name="Lunch at the lodge", description=None,
+                start_time=dt_time(13, 0), duration_minutes=60, sort_order=order,
+                activity_type="MEAL", source="hardcoded_meal",
+            )
+            order += 1
 
         # --- Overlap-scheduling decision applied here ---
         #
@@ -783,7 +881,8 @@ class ItineraryPlanningEngine:
         # what prevents the "Arrival transfer 14:00-19:00 overlaps
         # Afternoon game drive 16:00" class of conflict that was
         # previously only caught (and not always resolved) by
-        # ScheduleRepairEngine after the fact.
+        # ScheduleRepairEngine after the fact. UNCHANGED from the
+        # previous version of this file.
         afternoon_start_minutes = self._minutes(AFTERNOON_SLOT_DEFAULT_START)
         evening_start_minutes = self._minutes(EVENING_SLOT_START)
         skip_afternoon_slot = False
@@ -840,6 +939,8 @@ class ItineraryPlanningEngine:
         afternoon = self._consume_next_activity(pool=pool, cursor=cursor, dest_id=dest_id)
 
         if afternoon:
+            if first_activity_id is None:
+                first_activity_id = afternoon["id"]
             self._add_drawer(
                 shelf=shelf, name=afternoon["name"], description=afternoon["description"],
                 start_time=afternoon_start, duration_minutes=150,
