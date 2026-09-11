@@ -84,7 +84,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, timedelta, time as dt_time
+from datetime import date, time as dt_time, timedelta
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -518,9 +518,7 @@ class ItineraryPlanningEngine:
                 )
                 self.db.add(shelf)
 
-                # Explicitly populate the in-memory relationship
-                # collection -- setting the raw FK column alone does
-                # not update the backref'd collection in memory.
+                # Explicitly populate the in-memory relationship collection
                 if hasattr(shelf, "cabinet"):
                     shelf.cabinet = cabinet
                 elif shelf not in cabinet.shelves:
@@ -593,61 +591,76 @@ class ItineraryPlanningEngine:
             return default
 
     def _fetch_destination_meta(self, destination_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """
+        Fetches metadata for requested destinations from travel_places (and optionally
+        estimated_visit_durations). Supports lookups by UUID string or slug.
+        """
         if not destination_ids:
             return {}
 
-        rows = self.db.execute(
-            text(
-                """
-                SELECT
-                    CAST(id AS text) AS id,
-                    name,
-                    CAST(country AS text) AS country,
-                    CAST(destination_type AS text) AS destination_type
-                FROM travel_places
-                WHERE id = ANY(CAST(:ids AS uuid[]))
-                """
-            ),
-            {"ids": destination_ids},
-        ).fetchall()
+        sql = text(
+            """
+            SELECT
+                CAST(id AS text) AS id,
+                name,
+                CAST(country AS text) AS country,
+                CAST(destination_type AS text) AS destination_type,
+                slug
+            FROM travel_places
+            WHERE id::text = ANY(:ids) OR slug = ANY(:ids)
+            """
+        )
+        rows = self.db.execute(sql, {"ids": destination_ids}).fetchall()
 
         meta: dict[str, dict[str, Any]] = {}
+        found_ids: list[str] = []
+
         for row in rows:
-            destination_id = str(row[0])
-            meta[destination_id] = {
+            dest_id = str(row[0])
+            dest_slug = row[4]
+            found_ids.append(dest_id)
+            
+            meta_payload = {
+                "id": dest_id,
                 "country": row[2],
                 "headline_label": row[1],
                 "destination_type": row[3],
+                "slug": dest_slug,
                 "min_nights": 1,
             }
+            
+            meta[dest_id] = meta_payload
+            if dest_slug:
+                meta[dest_slug] = meta_payload
 
-        try:
-            table_exists = self.db.execute(
-                text("SELECT to_regclass('estimated_visit_durations')")
-            ).scalar()
+        if found_ids:
+            try:
+                table_exists = self.db.execute(
+                    text("SELECT to_regclass('estimated_visit_durations')")
+                ).scalar()
 
-            if table_exists:
-                min_rows = self.db.execute(
-                    text(
-                        """
-                        SELECT CAST(destination_id AS text), MIN(recommended_nights_min)
-                        FROM estimated_visit_durations
-                        WHERE destination_id = ANY(CAST(:ids AS uuid[]))
-                          AND scope = 'full_destination'
-                          AND recommended_nights_min IS NOT NULL
-                        GROUP BY destination_id
-                        """
-                    ),
-                    {"ids": destination_ids},
-                ).fetchall()
+                if table_exists:
+                    min_rows = self.db.execute(
+                        text(
+                            """
+                            SELECT CAST(destination_id AS text), MIN(recommended_nights_min)
+                            FROM estimated_visit_durations
+                            WHERE destination_id::text = ANY(:ids)
+                              AND scope = 'full_destination'
+                              AND recommended_nights_min IS NOT NULL
+                            GROUP BY destination_id
+                            """
+                        ),
+                        {"ids": found_ids},
+                    ).fetchall()
 
-                for destination_id, minimum in min_rows:
-                    destination_id = str(destination_id)
-                    if destination_id in meta and minimum is not None:
-                        meta[destination_id]["min_nights"] = max(1, int(minimum))
+                    for destination_id, minimum in min_rows:
+                        destination_id = str(destination_id)
+                        if destination_id in meta and minimum is not None:
+                            meta[destination_id]["min_nights"] = max(1, int(minimum))
 
-        except Exception as exc:
-            logger.warning("Could not read estimated_visit_durations: %s", exc)
+            except Exception as exc:
+                logger.warning("Could not read estimated_visit_durations: %s", exc)
 
         return meta
 
@@ -699,7 +712,9 @@ class ItineraryPlanningEngine:
                     md5(CAST(:cab_id AS text) || '|' || CAST(a.id AS text)) AS deterministic_order
 
                 FROM activities a
-                WHERE a.destination_id = CAST(:dest_id AS uuid)
+                WHERE a.destination_id::text = :dest_id OR a.destination_id IN (
+                    SELECT id FROM travel_places WHERE slug = :dest_id
+                )
             )
             SELECT id, name, description, category, difficulty, style_position, month_mismatch
             FROM ranked
@@ -943,15 +958,7 @@ class ItineraryPlanningEngine:
             )
             order += 1
 
-        # Lunch: sequenced by sort_order only, never by a clock-time
-        # comparison against the transfer -- since neither the
-        # transfer nor lunch now carries an absolute start_time, there
-        # is no arithmetic that can put lunch "before" a transfer that
-        # precedes it in sort_order. This is what closes out both the
-        # original "Game Drive 06:00 same day as Arrival 14:00" bug
-        # and the follow-up "Lunch 13:00 before Arrival transfer 14:00"
-        # bug -- both were only possible because absolute clock times
-        # existed to be compared incorrectly.
+        # Lunch: sequenced by sort_order only
         self._add_drawer(
             shelf=shelf, name="Lunch at the lodge", description=None,
             start_time=None, duration_minutes=60, sort_order=order,
@@ -999,14 +1006,6 @@ class ItineraryPlanningEngine:
     def _destination_arrival_transfer(
         self, shelf: Shelf, order: int, dest_id: str, origin_dest_id: str | None,
     ) -> tuple[int, bool]:
-        """
-        Returns (order, transfer_leg_known) -- transfer_leg_known is
-        True when a real measured duration was found (used only for
-        logging/diagnostics now that no downstream clock-time
-        arithmetic depends on it; ordering is handled entirely by
-        sort_order per this rewrite's change (D)).
-        """
-
         row = None
 
         if origin_dest_id is not None:
@@ -1015,11 +1014,14 @@ class ItineraryPlanningEngine:
                     """
                     SELECT distance_km, duration_minutes_dry_season
                     FROM drive_times_between_destinations
-                    WHERE from_destination_id = CAST(:from_destination_id AS uuid)
-                      AND to_destination_id = CAST(:to_destination_id AS uuid)
+                    WHERE (from_destination_id::text = :from_id OR from_destination_id IN (
+                        SELECT id FROM travel_places WHERE slug = :from_id
+                    )) AND (to_destination_id::text = :to_id OR to_destination_id IN (
+                        SELECT id FROM travel_places WHERE slug = :to_id
+                    ))
                     """
                 ),
-                {"from_destination_id": origin_dest_id, "to_destination_id": dest_id},
+                {"from_id": origin_dest_id, "to_id": dest_id},
             ).fetchone()
         else:
             logger.warning(
@@ -1101,11 +1103,14 @@ class ItineraryPlanningEngine:
                     """
                     SELECT distance_km, duration_minutes_dry_season
                     FROM drive_times_between_destinations
-                    WHERE from_destination_id = CAST(:from_dest AS uuid)
-                      AND to_destination_id = CAST(:to_dest AS uuid)
+                    WHERE (from_destination_id::text = :frm OR from_destination_id IN (
+                        SELECT id FROM travel_places WHERE slug = :frm
+                    )) AND (to_destination_id::text = :to OR to_destination_id IN (
+                        SELECT id FROM travel_places WHERE slug = :to
+                    ))
                     """
                 ),
-                {"from_dest": frm, "to_dest": to},
+                {"frm": frm, "to": to},
             ).fetchone()
 
             distance_km = None
@@ -1132,21 +1137,29 @@ class ItineraryPlanningEngine:
                         WHERE (
                             f.origin_airport_id IN (
                                 SELECT airport_id FROM destination_airports
-                                WHERE destination_id = CAST(:frm AS uuid) AND is_primary_gateway
+                                WHERE destination_id::text = :frm OR destination_id IN (
+                                    SELECT id FROM travel_places WHERE slug = :frm
+                                ) AND is_primary_gateway
                             )
                             OR f.origin_airstrip_id IN (
                                 SELECT id FROM airstrips
-                                WHERE destination_id = CAST(:frm AS uuid)
+                                WHERE destination_id::text = :frm OR destination_id IN (
+                                    SELECT id FROM travel_places WHERE slug = :frm
+                                )
                             )
                         )
                         AND (
                             f.destination_airport_id IN (
                                 SELECT airport_id FROM destination_airports
-                                WHERE destination_id = CAST(:to AS uuid) AND is_primary_gateway
+                                WHERE destination_id::text = :to OR destination_id IN (
+                                    SELECT id FROM travel_places WHERE slug = :to
+                                ) AND is_primary_gateway
                             )
                             OR f.destination_airstrip_id IN (
                                 SELECT id FROM airstrips
-                                WHERE destination_id = CAST(:to AS uuid)
+                                WHERE destination_id::text = :to OR destination_id IN (
+                                    SELECT id FROM travel_places WHERE slug = :to
+                                )
                             )
                         )
                         ORDER BY f.duration_minutes ASC NULLS LAST
@@ -1194,9 +1207,12 @@ class ItineraryPlanningEngine:
                         "Inter-country overland leg %s -> %s has no border_crossings record.", frm, to,
                     )
 
+            frm_uuid = meta.get(frm, {}).get("id", frm)
+            to_uuid = meta.get(to, {}).get("id", to)
+
             sequence += 1
             hinge = Hinge(
-                cabinet_id=cabinet_id, from_destination_id=frm, to_destination_id=to,
+                cabinet_id=cabinet_id, from_destination_id=frm_uuid, to_destination_id=to_uuid,
                 sequence_order=sequence, distance_km=distance_km, duration_minutes=duration_minutes,
                 mode=mode, source=source, is_inter_country=is_inter_country,
                 requires_border_crossing=is_inter_country, border_crossing_id=border_crossing_id,
@@ -1228,8 +1244,9 @@ class ItineraryPlanningEngine:
                 """
                 SELECT id, name, tier
                 FROM lodges
-                WHERE destination_id = CAST(:dest_id AS uuid)
-                  AND tier::text = ANY(CAST(:tiers AS text[]))
+                WHERE (destination_id::text = :dest_id OR destination_id IN (
+                    SELECT id FROM travel_places WHERE slug = :dest_id
+                )) AND tier::text = ANY(CAST(:tiers AS text[]))
                 ORDER BY star_rating DESC NULLS LAST
                 LIMIT 1
                 """
@@ -1264,7 +1281,7 @@ class ItineraryPlanningEngine:
 
             armrest = Armrest(
                 shelf_id=shelf.id, mode=mode, description=description,
-                duration_minutes=minutes, # left as None when genuinely unknown
+                duration_minutes=minutes,
                 is_private=(mode == "private_4x4"),
             )
         else:
@@ -1284,12 +1301,6 @@ class ItineraryPlanningEngine:
         elif is_last_day:
             meals = ["breakfast"]
         elif is_transit_day:
-            # Matches _populate_transit_day_drawers: only dinner is
-            # actually built as a drawer on a transit day (breakfast
-            # happened at the previous destination, lunch is
-            # consumed by travel time) -- the Tray records should
-            # reflect what's actually being served, not the full
-            # three-meal default.
             meals = ["dinner"]
         else:
             meals = ["breakfast", "lunch", "dinner"]
@@ -1313,11 +1324,11 @@ class ItineraryPlanningEngine:
                 text(
                     """
                     SELECT url FROM photo_states
-                    WHERE activity_id = CAST(:activity_id AS uuid) AND url IS NOT NULL
+                    WHERE activity_id::text = :activity_id AND url IS NOT NULL
                     ORDER BY id LIMIT 1
                     """
                 ),
-                {"activity_id": activity_id},
+                {"activity_id": str(activity_id)},
             ).fetchone()
         except Exception as exc:
             logger.debug("Activity-specific photo lookup unavailable: %s", exc)
@@ -1328,11 +1339,13 @@ class ItineraryPlanningEngine:
                     text(
                         """
                         SELECT url FROM photo_states
-                        WHERE destination_id = CAST(:destination_id AS uuid) AND url IS NOT NULL
+                        WHERE (destination_id::text = :dest_id OR destination_id IN (
+                            SELECT id FROM travel_places WHERE slug = :dest_id
+                        )) AND url IS NOT NULL
                         ORDER BY id LIMIT 1
                         """
                     ),
-                    {"destination_id": destination_id},
+                    {"dest_id": destination_id},
                 ).fetchone()
             except Exception as exc:
                 logger.debug("Destination photo lookup unavailable: %s", exc)
