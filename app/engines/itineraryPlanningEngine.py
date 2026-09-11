@@ -1,17 +1,16 @@
 """
-ItineraryPlanningEngine v4
----------------------------
+itineraryPlanningEngine.py
+==========================
 
 Production itinerary builder for the persisted furniture schema.
 
 CHANGE LOG (this rewrite -- transit-day fix, backend stage 2)
 ------------------------------------------------------------------
-This rewrite depends on TWO other changes already made:
-  1. migration 006_shelf_day_kind.sql -- adds shelves.day_kind
-     ("STANDARD" | "TRANSIT"), and its matching models_furniture.py
-     Shelf.day_kind column.
-  2. pipeline_adapters.py -- allocate_days_for_route() extracted as a
-     standalone pure function; transit_days_from_day_plan() added.
+1. migration 006_shelf_day_kind.sql -- adds shelves.day_kind
+   ("STANDARD" | "TRANSIT"), and its matching models_furniture.py
+   Shelf.day_kind column.
+2. pipeline_adapters.py -- allocate_days_for_route() extracted as a
+   standalone pure function; transit_days_from_day_plan() added.
 
 WHAT CHANGED AND WHY
 ---------------------
@@ -25,8 +24,7 @@ WHAT CHANGED AND WHY
     REQUIRES the caller to pass `day_allocation` (the same
     list[int]-per-destination shape _allocate_days() used to return)
     and `transit_days` (day_number -> bool, from
-    pipeline_adapters.transit_days_from_day_plan()). See
-    itinerary_v2.py's reordered generate() for the calling sequence.
+    pipeline_adapters.transit_days_from_day_plan()).
 
 (B) TRANSIT-day drawer template.
     When transit_days.get(day_number) is True, _populate_drawers()
@@ -34,57 +32,28 @@ WHAT CHANGED AND WHY
     transfer/settle-in drawers (matching the "Airport -> Lodge -> free
     time -> Dinner" reference shape) and marks the Shelf itself as
     day_kind="TRANSIT". It does NOT force a lunch slot, an EXPERIENCE
-    activity, or a sundowner onto that day -- those were the
-    fabricated entries ("Night Lemur Walk" bolted onto a day consumed
-    by an international flight) that prompted this whole fix. If the
-    leg's real duration/mode is known (RouteGeographyEngine resolved a
-    flights_table or drive_times_between_destinations row), that real
-    fact is shown; if not, the existing honest "duration unavailable"
-    wording is preserved -- no fabrication either way.
+    activity, or a sundowner onto that day. If the leg's real 
+    duration/mode is known, that real fact is shown; if not, the existing
+    honest "duration unavailable" wording is preserved.
 
 (C) Clock times removed except the two safari game-drive slots.
     Per direct product decision: only the morning game-drive slot
-    (still DEFAULT_GAME_DRIVE_START = 06:00) and an evening/
-    late-afternoon game-drive slot keep a real dt_time start_time.
-    Every other drawer (meals, transfers, cultural visits, walks,
-    museum stops, sundowners, settling-in) is now built with
-    start_time=None and relies on duration_minutes + sort_order for
-    display ordering -- matching the agreed "Airport (1h20m) -> Lodge
-    -> free time -> Dinner" relative-sequence UX instead of a fixed
-    24-hour clock label. This also sidesteps the whole class of
-    "lunch scheduled before the transfer that precedes it" bugs this
-    file has already been through twice: with no absolute clock time
-    to get wrong, only relative order (which sort_order already
-    enforces) matters.
-    _is_game_drive_category() gates the ONLY two call sites that still
-    assign a real start_time; every other call site now passes
-    start_time=None.
+    (DEFAULT_GAME_DRIVE_START = 06:00) and an evening/late-afternoon 
+    game-drive slot keep a real dt_time start_time. Every other drawer 
+    is built with start_time=None and relies on duration_minutes + 
+    sort_order for display ordering.
 
-(D) Arrival-day lunch-after-transfer ordering (carried forward from
-    the previous rewrite, still correct under the new no-clock-time
-    regime): lunch is sequenced AFTER the arrival transfer drawer via
-    sort_order, never via a fixed clock comparison, since fixed clock
-    times for lunch no longer exist to compare against. This is
-    actually a simplification -- the previous MIN_USABLE_AFTERNOON_
-    MINUTES-vs-lunch-start arithmetic is no longer needed for
-    ordering purposes now that lunch has no absolute time; sort_order
-    alone guarantees it never renders before the transfer.
-
-PRIOR CHANGE LOG (audit-confirmed fixes, still present)
-------------------------------------------------------------------
-1. Native PostgreSQL array binding in _fetch_ranked_activity_pool()
-   (text[] cast, native Python list, no hand-built array literal).
-2. None-duration tolerance throughout (route_geography.py's
-   no-fabrication rule -- a Hinge's duration_minutes can be
-   legitimately None; every place that could previously assume a
-   number now branches on None explicitly).
+(D) Arrival-day lunch-after-transfer ordering: lunch is sequenced AFTER 
+    the arrival transfer drawer via sort_order, never via a fixed clock 
+    comparison, since fixed clock times for lunch no longer exist to 
+    compare against.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, time as dt_time, timedelta
+from datetime import date, timedelta, time as dt_time
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -105,9 +74,7 @@ logger = logging.getLogger(__name__)
 
 # The ONLY two drawers in the entire engine that still carry a real
 # clock time, per direct product decision -- animals are genuinely
-# most active in these windows, so an absolute time (not just a
-# relative "morning"/"evening" label) is meaningful information here,
-# unlike every other activity type.
+# most active in these windows.
 DEFAULT_GAME_DRIVE_START = dt_time(6, 0)
 EVENING_GAME_DRIVE_START = dt_time(16, 0)
 
@@ -302,7 +269,6 @@ def _format_transfer_description(mode: str | None, minutes: int | None) -> str:
     an unavailable duration rather than ever rendering "None" or
     inventing a placeholder number.
     """
-
     mode_label = {
         "scheduled_flight": "Scheduled flight",
         "charter_flight": "Charter flight",
@@ -319,6 +285,14 @@ class ItineraryPlanningEngine:
     def __init__(self, db: Session):
         self.db = db
 
+    def fetch_destination_meta(self, destination_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """
+        Public contract method called by ItineraryOrchestrator and internally.
+        Fetches metadata for requested destinations from travel_places (and
+        estimated_visit_durations if available).
+        """
+        return self._fetch_destination_meta(destination_ids)
+
     def build(
         self,
         request: dict[str, Any],
@@ -328,33 +302,11 @@ class ItineraryPlanningEngine:
         transit_days: Mapping[int, bool] | None = None,
     ) -> BuildResult:
         """
-        Parameters
-        ----------
-        request, destination_ids:
-            Unchanged from previous versions.
-        day_allocation:
-            REQUIRED. list[int], one entry per destination in
-            destination_ids, giving how many nights that destination
-            receives -- the exact shape
-            pipeline_adapters.allocate_days_for_route() returns as its
-            first element. This engine no longer computes its own
-            allocation (see module docstring, change (A)); the caller
-            (ItineraryOrchestrator) is responsible for calling
-            allocate_days_for_route() first and passing the result
-            here, so DayArchetypeEngine can classify days using the
-            same allocation before this method runs.
-        transit_days:
-            Optional day_number -> bool mapping from
-            pipeline_adapters.transit_days_from_day_plan(). A day
-            missing from this mapping, or transit_days=None entirely,
-            is treated as NOT a transit day (falls back to the
-            existing STANDARD-day behavior) -- so callers that have
-            not yet wired in the archetype-classification step see no
-            change in behavior, matching the same conservative-default
-            convention used by overnight_required_from_day_plan
-            elsewhere in this pipeline.
+        Builds and persists the full Cabinet model structure.
+        
+        Requires externally computed `day_allocation` and optional `transit_days` 
+        map (day_number -> bool) from DayArchetypeEngine / pipeline_adapters.
         """
-
         days = self._safe_int(request.get("days"), 0)
 
         if days < 1:
@@ -407,8 +359,7 @@ class ItineraryPlanningEngine:
                 f"({len(day_allocation)}) does not match destination_ids "
                 f"length ({len(destination_ids)}) after cleaning. The "
                 "caller must recompute allocation if destination_ids "
-                "was trimmed to fit `days` (see the length-mismatch "
-                "warning above)."
+                "was trimmed to fit `days`."
             )
 
         transit_days = transit_days or {}
@@ -518,7 +469,6 @@ class ItineraryPlanningEngine:
                 )
                 self.db.add(shelf)
 
-                # Explicitly populate the in-memory relationship collection
                 if hasattr(shelf, "cabinet"):
                     shelf.cabinet = cabinet
                 elif shelf not in cabinet.shelves:
@@ -591,76 +541,62 @@ class ItineraryPlanningEngine:
             return default
 
     def _fetch_destination_meta(self, destination_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """
-        Fetches metadata for requested destinations from travel_places (and optionally
-        estimated_visit_durations). Supports lookups by UUID string or slug.
-        """
         if not destination_ids:
             return {}
 
-        sql = text(
-            """
-            SELECT
-                CAST(id AS text) AS id,
-                name,
-                CAST(country AS text) AS country,
-                CAST(destination_type AS text) AS destination_type,
-                slug
-            FROM travel_places
-            WHERE id::text = ANY(:ids) OR slug = ANY(:ids)
-            """
-        )
-        rows = self.db.execute(sql, {"ids": destination_ids}).fetchall()
+        rows = self.db.execute(
+            text(
+                """
+                SELECT
+                    CAST(id AS text) AS id,
+                    name,
+                    CAST(country AS text) AS country,
+                    CAST(destination_type AS text) AS destination_type
+                FROM travel_places
+                WHERE id = ANY(CAST(:ids AS uuid[]))
+                """
+            ),
+            {"ids": destination_ids},
+        ).fetchall()
 
         meta: dict[str, dict[str, Any]] = {}
-        found_ids: list[str] = []
-
         for row in rows:
-            dest_id = str(row[0])
-            dest_slug = row[4]
-            found_ids.append(dest_id)
-            
-            meta_payload = {
-                "id": dest_id,
+            destination_id = str(row[0])
+            meta[destination_id] = {
+                "id": destination_id,
                 "country": row[2],
                 "headline_label": row[1],
                 "destination_type": row[3],
-                "slug": dest_slug,
                 "min_nights": 1,
             }
-            
-            meta[dest_id] = meta_payload
-            if dest_slug:
-                meta[dest_slug] = meta_payload
 
-        if found_ids:
-            try:
-                table_exists = self.db.execute(
-                    text("SELECT to_regclass('estimated_visit_durations')")
-                ).scalar()
+        try:
+            table_exists = self.db.execute(
+                text("SELECT to_regclass('estimated_visit_durations')")
+            ).scalar()
 
-                if table_exists:
-                    min_rows = self.db.execute(
-                        text(
-                            """
-                            SELECT CAST(destination_id AS text), MIN(recommended_nights_min)
-                            FROM estimated_visit_durations
-                            WHERE destination_id::text = ANY(:ids)
-                              AND scope = 'full_destination'
-                              AND recommended_nights_min IS NOT NULL
-                            GROUP BY destination_id
-                            """
-                        ),
-                        {"ids": found_ids},
-                    ).fetchall()
+            if table_exists:
+                min_rows = self.db.execute(
+                    text(
+                        """
+                        SELECT CAST(destination_id AS text), MIN(recommended_nights_min)
+                        FROM estimated_visit_durations
+                        WHERE destination_id = ANY(CAST(:ids AS uuid[]))
+                          AND scope = 'full_destination'
+                          AND recommended_nights_min IS NOT NULL
+                        GROUP BY destination_id
+                        """
+                    ),
+                    {"ids": destination_ids},
+                ).fetchall()
 
-                    for destination_id, minimum in min_rows:
-                        destination_id = str(destination_id)
-                        if destination_id in meta and minimum is not None:
-                            meta[destination_id]["min_nights"] = max(1, int(minimum))
+                for destination_id, minimum in min_rows:
+                    destination_id = str(destination_id)
+                    if destination_id in meta and minimum is not None:
+                        meta[destination_id]["min_nights"] = max(1, int(minimum))
 
-            except Exception as exc:
-                logger.warning("Could not read estimated_visit_durations: %s", exc)
+        except Exception as exc:
+            logger.warning("Could not read estimated_visit_durations: %s", exc)
 
         return meta
 
@@ -712,9 +648,7 @@ class ItineraryPlanningEngine:
                     md5(CAST(:cab_id AS text) || '|' || CAST(a.id AS text)) AS deterministic_order
 
                 FROM activities a
-                WHERE a.destination_id::text = :dest_id OR a.destination_id IN (
-                    SELECT id FROM travel_places WHERE slug = :dest_id
-                )
+                WHERE a.destination_id = CAST(:dest_id AS uuid)
             )
             SELECT id, name, description, category, difficulty, style_position, month_mismatch
             FROM ranked
@@ -774,19 +708,6 @@ class ItineraryPlanningEngine:
         )
 
     def _populate_first_day_drawers(self, shelf: Shelf) -> None:
-        """
-        The very first day of the whole trip. Clock times are now
-        dropped -- Airport welcome / Transfer to lodge / free time /
-        Dinner as a relative sequence, matching the agreed reference
-        shape:
-
-            Airport welcome
-                v (duration)
-            Transfer to lodge
-                v (free time)
-            Dinner at the lodge
-        """
-
         order = 1
         self._add_drawer(
             shelf=shelf, name="Airport welcome",
@@ -841,28 +762,6 @@ class ItineraryPlanningEngine:
         self, shelf: Shelf, legs: list[dict[str, Any]], destination_index: int,
         is_arrival_day: bool,
     ) -> None:
-        """
-        A day whose primary content is a long-haul/intercontinental
-        transfer (day_kind="TRANSIT" on the Shelf itself, set by the
-        caller in build()). This is the direct fix for the "Tanzania
-        -> Ethiopia" / "Tanzania -> Madagascar" bug: no activity slot
-        is fabricated here. The day shows only the real transfer leg
-        (with real duration/mode if RouteGeographyEngine resolved one,
-        honestly labeled "unavailable" if not) plus settle-in time and
-        dinner -- structurally identical to how the very first arrival
-        day of the whole trip is already (correctly) handled, extended
-        to include the flight/transfer segment itself as its own
-        explicit drawer so the traveler can see it's a travel day, not
-        a normal park day.
-
-        A transit day is by construction always also an arrival day
-        into the next destination (that's what triggered
-        LONG_TRANSFER classification in the first place) -- but this
-        method does not assume that; if is_arrival_day is somehow
-        False (defensive), it still produces an honest, minimal
-        transit-day shape rather than guessing.
-        """
-
         order = 1
 
         leg = None
@@ -923,10 +822,6 @@ class ItineraryPlanningEngine:
             )
             order += 1
 
-        # On an arrival day there is no independent "morning slot" --
-        # the transfer occupies the morning. Nothing is consumed from
-        # pool/cursor for this slot; the activity that would have
-        # filled it is used for the afternoon/game-drive slot instead.
         if is_arrival_day:
             morning = None
         else:
@@ -958,7 +853,6 @@ class ItineraryPlanningEngine:
             )
             order += 1
 
-        # Lunch: sequenced by sort_order only
         self._add_drawer(
             shelf=shelf, name="Lunch at the lodge", description=None,
             start_time=None, duration_minutes=60, sort_order=order,
@@ -1014,21 +908,16 @@ class ItineraryPlanningEngine:
                     """
                     SELECT distance_km, duration_minutes_dry_season
                     FROM drive_times_between_destinations
-                    WHERE (from_destination_id::text = :from_id OR from_destination_id IN (
-                        SELECT id FROM travel_places WHERE slug = :from_id
-                    )) AND (to_destination_id::text = :to_id OR to_destination_id IN (
-                        SELECT id FROM travel_places WHERE slug = :to_id
-                    ))
+                    WHERE from_destination_id = CAST(:from_destination_id AS uuid)
+                      AND to_destination_id = CAST(:to_destination_id AS uuid)
                     """
                 ),
-                {"from_id": origin_dest_id, "to_id": dest_id},
+                {"from_destination_id": origin_dest_id, "to_destination_id": dest_id},
             ).fetchone()
         else:
             logger.warning(
                 "_destination_arrival_transfer called for %s with no "
-                "origin_dest_id; cannot perform a directed drive_times "
-                "lookup. Using the no-fabrication fallback instead of "
-                "an undirected (and potentially wrong-route) query.",
+                "origin_dest_id; using fallback estimate.",
                 dest_id,
             )
 
@@ -1103,14 +992,11 @@ class ItineraryPlanningEngine:
                     """
                     SELECT distance_km, duration_minutes_dry_season
                     FROM drive_times_between_destinations
-                    WHERE (from_destination_id::text = :frm OR from_destination_id IN (
-                        SELECT id FROM travel_places WHERE slug = :frm
-                    )) AND (to_destination_id::text = :to OR to_destination_id IN (
-                        SELECT id FROM travel_places WHERE slug = :to
-                    ))
+                    WHERE from_destination_id = CAST(:from_dest AS uuid)
+                      AND to_destination_id = CAST(:to_dest AS uuid)
                     """
                 ),
-                {"frm": frm, "to": to},
+                {"from_dest": frm, "to_dest": to},
             ).fetchone()
 
             distance_km = None
@@ -1137,29 +1023,21 @@ class ItineraryPlanningEngine:
                         WHERE (
                             f.origin_airport_id IN (
                                 SELECT airport_id FROM destination_airports
-                                WHERE destination_id::text = :frm OR destination_id IN (
-                                    SELECT id FROM travel_places WHERE slug = :frm
-                                ) AND is_primary_gateway
+                                WHERE destination_id = CAST(:frm AS uuid) AND is_primary_gateway
                             )
                             OR f.origin_airstrip_id IN (
                                 SELECT id FROM airstrips
-                                WHERE destination_id::text = :frm OR destination_id IN (
-                                    SELECT id FROM travel_places WHERE slug = :frm
-                                )
+                                WHERE destination_id = CAST(:frm AS uuid)
                             )
                         )
                         AND (
                             f.destination_airport_id IN (
                                 SELECT airport_id FROM destination_airports
-                                WHERE destination_id::text = :to OR destination_id IN (
-                                    SELECT id FROM travel_places WHERE slug = :to
-                                ) AND is_primary_gateway
+                                WHERE destination_id = CAST(:to AS uuid) AND is_primary_gateway
                             )
                             OR f.destination_airstrip_id IN (
                                 SELECT id FROM airstrips
-                                WHERE destination_id::text = :to OR destination_id IN (
-                                    SELECT id FROM travel_places WHERE slug = :to
-                                )
+                                WHERE destination_id = CAST(:to AS uuid)
                             )
                         )
                         ORDER BY f.duration_minutes ASC NULLS LAST
@@ -1207,12 +1085,9 @@ class ItineraryPlanningEngine:
                         "Inter-country overland leg %s -> %s has no border_crossings record.", frm, to,
                     )
 
-            frm_uuid = meta.get(frm, {}).get("id", frm)
-            to_uuid = meta.get(to, {}).get("id", to)
-
             sequence += 1
             hinge = Hinge(
-                cabinet_id=cabinet_id, from_destination_id=frm_uuid, to_destination_id=to_uuid,
+                cabinet_id=cabinet_id, from_destination_id=frm, to_destination_id=to,
                 sequence_order=sequence, distance_km=distance_km, duration_minutes=duration_minutes,
                 mode=mode, source=source, is_inter_country=is_inter_country,
                 requires_border_crossing=is_inter_country, border_crossing_id=border_crossing_id,
@@ -1244,9 +1119,8 @@ class ItineraryPlanningEngine:
                 """
                 SELECT id, name, tier
                 FROM lodges
-                WHERE (destination_id::text = :dest_id OR destination_id IN (
-                    SELECT id FROM travel_places WHERE slug = :dest_id
-                )) AND tier::text = ANY(CAST(:tiers AS text[]))
+                WHERE destination_id = CAST(:dest_id AS uuid)
+                  AND tier::text = ANY(CAST(:tiers AS text[]))
                 ORDER BY star_rating DESC NULLS LAST
                 LIMIT 1
                 """
@@ -1324,11 +1198,11 @@ class ItineraryPlanningEngine:
                 text(
                     """
                     SELECT url FROM photo_states
-                    WHERE activity_id::text = :activity_id AND url IS NOT NULL
+                    WHERE activity_id = CAST(:activity_id AS uuid) AND url IS NOT NULL
                     ORDER BY id LIMIT 1
                     """
                 ),
-                {"activity_id": str(activity_id)},
+                {"activity_id": activity_id},
             ).fetchone()
         except Exception as exc:
             logger.debug("Activity-specific photo lookup unavailable: %s", exc)
@@ -1339,13 +1213,11 @@ class ItineraryPlanningEngine:
                     text(
                         """
                         SELECT url FROM photo_states
-                        WHERE (destination_id::text = :dest_id OR destination_id IN (
-                            SELECT id FROM travel_places WHERE slug = :dest_id
-                        )) AND url IS NOT NULL
+                        WHERE destination_id = CAST(:destination_id AS uuid) AND url IS NOT NULL
                         ORDER BY id LIMIT 1
                         """
                     ),
-                    {"dest_id": destination_id},
+                    {"destination_id": destination_id},
                 ).fetchone()
             except Exception as exc:
                 logger.debug("Destination photo lookup unavailable: %s", exc)
