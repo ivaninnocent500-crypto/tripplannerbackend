@@ -1,80 +1,83 @@
 """
-ItineraryPlanningEngine v3
+ItineraryPlanningEngine v4
 ---------------------------
 
 Production itinerary builder for the persisted furniture schema.
 
-CHANGE LOG (audit-confirmed fixes)
-------------------------------------
-1. Native PostgreSQL array binding.
+CHANGE LOG (this rewrite -- transit-day fix, backend stage 2)
+------------------------------------------------------------------
+This rewrite depends on TWO other changes already made:
+  1. migration 006_shelf_day_kind.sql -- adds shelves.day_kind
+     ("STANDARD" | "TRANSIT"), and its matching models_furniture.py
+     Shelf.day_kind column.
+  2. pipeline_adapters.py -- allocate_days_for_route() extracted as a
+     standalone pure function; transit_days_from_day_plan() added.
 
-   _fetch_ranked_activity_pool() previously built the "ranked
-   categories" array parameter by hand-concatenating strings:
+WHAT CHANGED AND WHY
+---------------------
+(A) Day allocation is no longer computed inside this engine.
+    ItineraryPlanningEngine._allocate_days() has been DELETED from
+    this file -- that logic now lives in
+    pipeline_adapters.allocate_days_for_route(), called by
+    ItineraryOrchestrator BEFORE this engine runs, specifically so
+    DayArchetypeEngine can classify every day (including detecting
+    LONG_TRANSFER days) before any Drawer is constructed. build() now
+    REQUIRES the caller to pass `day_allocation` (the same
+    list[int]-per-destination shape _allocate_days() used to return)
+    and `transit_days` (day_number -> bool, from
+    pipeline_adapters.transit_days_from_day_plan()). See
+    itinerary_v2.py's reordered generate() for the calling sequence.
 
-       "{" + ",".join(ranked_categories) + "}"
+(B) TRANSIT-day drawer template.
+    When transit_days.get(day_number) is True, _populate_drawers()
+    now takes a completely different path: it builds ONLY structural
+    transfer/settle-in drawers (matching the "Airport -> Lodge -> free
+    time -> Dinner" reference shape) and marks the Shelf itself as
+    day_kind="TRANSIT". It does NOT force a lunch slot, an EXPERIENCE
+    activity, or a sundowner onto that day -- those were the
+    fabricated entries ("Night Lemur Walk" bolted onto a day consumed
+    by an international flight) that prompted this whole fix. If the
+    leg's real duration/mode is known (RouteGeographyEngine resolved a
+    flights_table or drive_times_between_destinations row), that real
+    fact is shown; if not, the existing honest "duration unavailable"
+    wording is preserved -- no fabrication either way.
 
-   This bypasses SQLAlchemy's type system. It happens to be safe today
-   only because ranked_categories always comes from hardcoded constant
-   dicts (TRAVEL_STYLE_CATEGORY_RANKS / DESTINATION_TYPE_CATEGORY_RANKS)
-   with no commas, quotes, or braces in any value -- but the query is
-   one config change away from a syntax error or, if those categories
-   are ever sourced dynamically, an injection vector. The list is now
-   passed as a native Python list and bound with an explicit
-   ``text[]`` cast, letting SQLAlchemy's own parameter binding do the
-   escaping.
+(C) Clock times removed except the two safari game-drive slots.
+    Per direct product decision: only the morning game-drive slot
+    (still DEFAULT_GAME_DRIVE_START = 06:00) and an evening/
+    late-afternoon game-drive slot keep a real dt_time start_time.
+    Every other drawer (meals, transfers, cultural visits, walks,
+    museum stops, sundowners, settling-in) is now built with
+    start_time=None and relies on duration_minutes + sort_order for
+    display ordering -- matching the agreed "Airport (1h20m) -> Lodge
+    -> free time -> Dinner" relative-sequence UX instead of a fixed
+    24-hour clock label. This also sidesteps the whole class of
+    "lunch scheduled before the transfer that precedes it" bugs this
+    file has already been through twice: with no absolute clock time
+    to get wrong, only relative order (which sort_order already
+    enforces) matters.
+    _is_game_drive_category() gates the ONLY two call sites that still
+    assign a real start_time; every other call site now passes
+    start_time=None.
 
-2. None-duration tolerance.
+(D) Arrival-day lunch-after-transfer ordering (carried forward from
+    the previous rewrite, still correct under the new no-clock-time
+    regime): lunch is sequenced AFTER the arrival transfer drawer via
+    sort_order, never via a fixed clock comparison, since fixed clock
+    times for lunch no longer exist to compare against. This is
+    actually a simplification -- the previous MIN_USABLE_AFTERNOON_
+    MINUTES-vs-lunch-start arithmetic is no longer needed for
+    ordering purposes now that lunch has no absolute time; sort_order
+    alone guarantees it never renders before the transfer.
 
-   route_geography.py's no-fabrication rule means a Hinge's
-   duration_minutes can now be legitimately None when no measured or
-   estimated route data exists for a leg -- this is intentional, not a
-   bug, and must not be silently converted into a fake number. Every
-   place that previously assumed a number (f-string formatting,
-   arithmetic comparisons) now branches on None explicitly and
-   produces an honest "duration unavailable" message instead of
-   "approximately None min" or a TypeError.
-
-3. Arrival-day morning-slot overlap (THIS REWRITE).
-
-   _populate_drawers previously scheduled a "morning" activity via
-   _default_start_for() on EVERY non-first, non-last day -- including
-   an arrival day at a new destination, where the day already begins
-   with an "Arrival transfer" drawer computed by
-   _destination_arrival_transfer(). _default_start_for() has no
-   awareness of that transfer: for a game_drive-category activity it
-   unconditionally returns 06:00, regardless of what time the arrival
-   transfer starts or ends. The result was itineraries like:
-
-       Arrival transfer 14:00
-       Crater Floor Game Drive 06:00 <- same calendar day, BEFORE
-                                             the arrival transfer that
-                                             was just scheduled
-
-   which is exactly the class of conflict ValidationEngine's
-   _check_time_overlaps() is built to catch (see validation.py) -- but
-   catching it after the fact and never avoiding it at construction
-   time meant a broken itinerary could still reach the UI whenever
-   that Footstool error wasn't (or isn't yet) surfaced end-to-end.
-
-   Fix: an arrival day has no independent "morning slot" at all -- the
-   transfer itself occupies the morning. _populate_drawers now skips
-   the morning-activity block entirely when is_arrival_day is True,
-   consuming nothing from the destination's activity pool for that
-   slot, and proceeds straight to lunch -> afternoon using the same
-   transfer_end_minutes-aware logic that already existed for the
-   afternoon slot (see AFTERNOON_SLOT_DEFAULT_START handling below,
-   unchanged from the previous version). This mirrors how real safari
-   operators structure an arrival day: "depending on when you arrive,
-   your first day may include a shortened afternoon game drive... or
-   simply time to settle in" -- never an activity slot that predates
-   the transfer that puts the traveler at the destination in the first
-   place.
-
-   Because the morning activity is skipped rather than consumed and
-   discarded, `cursor[dest_id]` is NOT advanced for that slot -- the
-   activity that would have been used stays at the front of the pool
-   and is used for the afternoon slot instead, so no seeded activity
-   is silently dropped from the destination's pool.
+PRIOR CHANGE LOG (audit-confirmed fixes, still present)
+------------------------------------------------------------------
+1. Native PostgreSQL array binding in _fetch_ranked_activity_pool()
+   (text[] cast, native Python list, no hand-built array literal).
+2. None-duration tolerance throughout (route_geography.py's
+   no-fabrication rule -- a Hinge's duration_minutes can be
+   legitimately None; every place that could previously assume a
+   number now branches on None explicitly).
 """
 
 from __future__ import annotations
@@ -82,7 +85,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import date, timedelta, time as dt_time
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -100,47 +103,19 @@ from app.db.models_furniture import (
 logger = logging.getLogger(__name__)
 
 
+# The ONLY two drawers in the entire engine that still carry a real
+# clock time, per direct product decision -- animals are genuinely
+# most active in these windows, so an absolute time (not just a
+# relative "morning"/"evening" label) is meaningful information here,
+# unlike every other activity type.
 DEFAULT_GAME_DRIVE_START = dt_time(6, 0)
-DEFAULT_ARRIVAL_TIME = dt_time(14, 0)
+EVENING_GAME_DRIVE_START = dt_time(16, 0)
 
 DRIVE_TO_FLIGHT_THRESHOLD_MINUTES = 6 * 60
-BORDER_BUFFER_NIGHTS = 1
 
-# --- Overlap-scheduling decision (arrival-day transfer vs. fixed
-# activity slots) ---
-#
-# _populate_drawers previously scheduled the afternoon activity at a
-# fixed 16:00 regardless of how long the arrival transfer actually
-# took. A measured 5-hour transfer starting at 14:00 does not end
-# until 19:00, which silently overlapped the fixed 16:00 slot --
-# caught downstream by ValidationEngine/ScheduleRepairEngine but never
-# avoided at construction time, even though the transfer duration is
-# already known before the afternoon slot is scheduled.
-#
-# Rule (see accompanying design note in _populate_drawers):
-# - If the transfer's measured end time leaves at least
-# MIN_USABLE_AFTERNOON_MINUTES before the evening slot, shift the
-# afternoon activity to start (transfer end + buffer) instead of
-# the fixed default.
-# - If the transfer consumes the day (ends at/after the evening
-# slot), drop the afternoon activity slot entirely and add an
-# honest "settling in" entry instead of fabricating an activity
-# that couldn't actually happen.
-# - An unknown (None) transfer duration falls back to the
-# conservative fixed default rather than being treated as zero.
-#
-# NEW IN THIS REWRITE: this same transfer-awareness now also governs
-# whether a MORNING slot exists at all on an arrival day -- see
-# _populate_drawers' is_arrival_day branch. There is no equivalent
-# "MORNING_SLOT_DEFAULT_START" constant because an arrival day never
-# has an independent morning slot to default; the transfer occupies
-# it unconditionally.
-ARRIVAL_TRANSFER_START = dt_time(14, 0)
-AFTERNOON_SLOT_DEFAULT_START = dt_time(16, 0)
-EVENING_SLOT_START = dt_time(18, 30)
-MIN_USABLE_AFTERNOON_MINUTES = 90
-POST_TRANSFER_BUFFER_MINUTES = 30
 FALLBACK_ARRIVAL_TRANSFER_MINUTES = 60
+FALLBACK_DEPARTURE_TRANSFER_MINUTES = 60
+FALLBACK_TRANSIT_LEG_MINUTES = 60
 
 
 DESTINATION_TYPE_CATEGORY_RANKS: dict[str, list[str]] = {
@@ -281,16 +256,8 @@ class BuildResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def _default_start_for(category: str | None) -> dt_time:
-    if category in {"game_drive", "walking_safari", "hiking", "mountain_climbing"}:
-        return DEFAULT_GAME_DRIVE_START
-    if category in {"diving", "snorkeling", "boat_safari", "fishing"}:
-        return dt_time(9, 0)
-    if category in {"cultural_visit", "shopping"}:
-        return dt_time(10, 0)
-    if category == "spa_wellness":
-        return dt_time(11, 0)
-    return dt_time(10, 0)
+def _is_game_drive_category(category: str | None) -> bool:
+    return category in {"game_drive", "walking_safari", "hiking", "mountain_climbing"}
 
 
 def _fallback_drawer_text(destination_type: str | None, variant_index: int) -> tuple[str, str]:
@@ -356,7 +323,37 @@ class ItineraryPlanningEngine:
         self,
         request: dict[str, Any],
         destination_ids: list[str],
+        *,
+        day_allocation: list[int],
+        transit_days: Mapping[int, bool] | None = None,
     ) -> BuildResult:
+        """
+        Parameters
+        ----------
+        request, destination_ids:
+            Unchanged from previous versions.
+        day_allocation:
+            REQUIRED. list[int], one entry per destination in
+            destination_ids, giving how many nights that destination
+            receives -- the exact shape
+            pipeline_adapters.allocate_days_for_route() returns as its
+            first element. This engine no longer computes its own
+            allocation (see module docstring, change (A)); the caller
+            (ItineraryOrchestrator) is responsible for calling
+            allocate_days_for_route() first and passing the result
+            here, so DayArchetypeEngine can classify days using the
+            same allocation before this method runs.
+        transit_days:
+            Optional day_number -> bool mapping from
+            pipeline_adapters.transit_days_from_day_plan(). A day
+            missing from this mapping, or transit_days=None entirely,
+            is treated as NOT a transit day (falls back to the
+            existing STANDARD-day behavior) -- so callers that have
+            not yet wired in the archetype-classification step see no
+            change in behavior, matching the same conservative-default
+            convention used by overnight_required_from_day_plan
+            elsewhere in this pipeline.
+        """
 
         days = self._safe_int(request.get("days"), 0)
 
@@ -404,6 +401,18 @@ class ItineraryPlanningEngine:
 
         destination_ids = cleaned_destination_ids
 
+        if len(day_allocation) != len(destination_ids):
+            raise ValueError(
+                "day_allocation length "
+                f"({len(day_allocation)}) does not match destination_ids "
+                f"length ({len(destination_ids)}) after cleaning. The "
+                "caller must recompute allocation if destination_ids "
+                "was trimmed to fit `days` (see the length-mismatch "
+                "warning above)."
+            )
+
+        transit_days = transit_days or {}
+
         cabinet = Cabinet(
             request_json=request,
             title=request.get("title") or self._default_title(request),
@@ -448,13 +457,7 @@ class ItineraryPlanningEngine:
             meta=meta,
         )
 
-        allocation, allocation_warnings = self._allocate_days(
-            destination_ids=destination_ids,
-            meta=meta,
-            total_days=days,
-            travel_style=travel_style,
-        )
-        warnings.extend(allocation_warnings)
+        allocation = day_allocation
 
         destination_types = {
             d: meta.get(d, {}).get("destination_type") for d in destination_ids
@@ -500,6 +503,7 @@ class ItineraryPlanningEngine:
                 is_first_day = day_number == 1
                 is_last_day = day_number == days
                 is_arrival_day = night_index == 0 and destination_index > 0
+                is_transit_day = bool(transit_days.get(day_number, False))
 
                 shelf = Shelf(
                     cabinet_id=cabinet.id,
@@ -507,21 +511,16 @@ class ItineraryPlanningEngine:
                     date=current_date,
                     destination_id=destination_id,
                     theme=self._theme_for(
-                        destination_index, night_index, is_first_day, is_last_day, destination_type,
+                        destination_index, night_index, is_first_day, is_last_day,
+                        destination_type, is_transit_day,
                     ),
+                    day_kind=("TRANSIT" if is_transit_day else "STANDARD"),
                 )
                 self.db.add(shelf)
 
-                # FIX: explicitly populate the in-memory relationship
-                # collection rather than relying only on cabinet_id +
-                # a later flush/lazy-reload to make this shelf visible
-                # via cabinet.shelves. Setting the raw FK column alone
-                # does not update the backref'd collection in memory --
-                # Cabinet.shelves relationship uses backref="cabinet",
-                # so assigning shelf.cabinet here keeps cabinet.shelves
-                # correct immediately for any caller that reads it
-                # right after build() returns in the same transaction
-                # (itinerary_v2.py's orchestrator does exactly this).
+                # Explicitly populate the in-memory relationship
+                # collection -- setting the raw FK column alone does
+                # not update the backref'd collection in memory.
                 if hasattr(shelf, "cabinet"):
                     shelf.cabinet = cabinet
                 elif shelf not in cabinet.shelves:
@@ -549,6 +548,9 @@ class ItineraryPlanningEngine:
                     is_first_day=is_first_day,
                     is_last_day=is_last_day,
                     is_arrival_day=is_arrival_day,
+                    is_transit_day=is_transit_day,
+                    legs=legs,
+                    destination_index=destination_index,
                 )
 
                 self._populate_headboard(
@@ -565,7 +567,10 @@ class ItineraryPlanningEngine:
                     is_arrival_day=is_arrival_day,
                 )
 
-                self._populate_trays(shelf=shelf, is_first_day=is_first_day, is_last_day=is_last_day)
+                self._populate_trays(
+                    shelf=shelf, is_first_day=is_first_day, is_last_day=is_last_day,
+                    is_transit_day=is_transit_day,
+                )
 
                 if first_activity_id:
                     self._populate_day_photo(
@@ -662,10 +667,6 @@ class ItineraryPlanningEngine:
 
         month_token = start_date.strftime("%B").lower() if start_date else None
 
-        # FIX: native list binding instead of a hand-built "{a,b,c}"
-        # array literal string. SQLAlchemy/psycopg handles the
-        # text[] cast and escaping; we never concatenate the category
-        # values into the SQL string ourselves.
         sql = text(
             """
             WITH ranked AS (
@@ -710,9 +711,6 @@ class ItineraryPlanningEngine:
             rows = self.db.execute(
                 sql,
                 {
-                    # Native Python list -- SQLAlchemy binds this as a
-                    # proper array parameter, not a string we built by
-                    # hand.
                     "ranked": ranked_categories,
                     "month": month_token,
                     "cab_id": cabinet_id,
@@ -728,90 +726,192 @@ class ItineraryPlanningEngine:
             for row in rows
         ]
 
+    # ------------------------------------------------------------------
+    # DRAWER CONSTRUCTION
+    # ------------------------------------------------------------------
+
     def _populate_drawers(
         self, shelf: Shelf, pool: list[dict[str, Any]], cursor: dict[str, int],
         fallback_counters: dict[str, int], dest_id: str, dest_type: str | None,
         travel_style: list[str], focus: str | None, day_number: int,
         is_first_day: bool, is_last_day: bool, is_arrival_day: bool,
+        is_transit_day: bool, legs: list[dict[str, Any]], destination_index: int,
         origin_dest_id: str | None = None,
+    ) -> str | None:
+
+        if is_first_day:
+            return self._populate_first_day_drawers(shelf)
+
+        if is_last_day:
+            return self._populate_last_day_drawers(shelf)
+
+        if is_transit_day:
+            return self._populate_transit_day_drawers(
+                shelf=shelf, legs=legs, destination_index=destination_index,
+                is_arrival_day=is_arrival_day,
+            )
+
+        return self._populate_standard_day_drawers(
+            shelf=shelf, pool=pool, cursor=cursor, fallback_counters=fallback_counters,
+            dest_id=dest_id, dest_type=dest_type, travel_style=travel_style,
+            day_number=day_number, is_arrival_day=is_arrival_day,
+            origin_dest_id=origin_dest_id,
+        )
+
+    def _populate_first_day_drawers(self, shelf: Shelf) -> None:
+        """
+        The very first day of the whole trip. Clock times are now
+        dropped -- Airport welcome / Transfer to lodge / free time /
+        Dinner as a relative sequence, matching the agreed reference
+        shape:
+
+            Airport welcome
+                v (duration)
+            Transfer to lodge
+                v (free time)
+            Dinner at the lodge
+        """
+
+        order = 1
+        self._add_drawer(
+            shelf=shelf, name="Airport welcome",
+            description="Met at the airport by your driver-guide.",
+            start_time=None, duration_minutes=20, sort_order=order,
+            activity_type="ARRIVAL", source="hardcoded_arrival_departure",
+        )
+        order += 1
+        self._add_drawer(
+            shelf=shelf, name="Transfer to lodge",
+            description="Transfer to the lodge. No excursion is assumed during this arrival transfer.",
+            start_time=None, duration_minutes=80, sort_order=order,
+            activity_type="TRANSFER", source="hardcoded_arrival_departure",
+        )
+        order += 1
+        self._add_drawer(
+            shelf=shelf, name="Free time at the lodge",
+            description="Settle in and rest ahead of dinner.",
+            start_time=None, duration_minutes=240, sort_order=order,
+            activity_type="FREE_TIME", source="hardcoded_arrival_departure", is_fallback=True,
+        )
+        order += 1
+        self._add_drawer(
+            shelf=shelf, name="Dinner at the lodge", description=None,
+            start_time=None, duration_minutes=90, sort_order=order,
+            activity_type="MEAL", source="hardcoded_meal",
+        )
+        return None
+
+    def _populate_last_day_drawers(self, shelf: Shelf) -> None:
+        order = 1
+        self._add_drawer(
+            shelf=shelf, name="Breakfast", description=None,
+            start_time=None, duration_minutes=45, sort_order=order,
+            activity_type="MEAL", source="hardcoded_meal",
+        )
+        order += 1
+        self._add_drawer(
+            shelf=shelf, name="Transfer to airport", description=None,
+            start_time=None, duration_minutes=120, sort_order=order,
+            activity_type="TRANSFER", source="hardcoded_arrival_departure",
+        )
+        order += 1
+        self._add_drawer(
+            shelf=shelf, name="Departure", description=None,
+            start_time=None, duration_minutes=30, sort_order=order,
+            activity_type="DEPARTURE", source="hardcoded_arrival_departure",
+        )
+        return None
+
+    def _populate_transit_day_drawers(
+        self, shelf: Shelf, legs: list[dict[str, Any]], destination_index: int,
+        is_arrival_day: bool,
+    ) -> None:
+        """
+        A day whose primary content is a long-haul/intercontinental
+        transfer (day_kind="TRANSIT" on the Shelf itself, set by the
+        caller in build()). This is the direct fix for the "Tanzania
+        -> Ethiopia" / "Tanzania -> Madagascar" bug: no activity slot
+        is fabricated here. The day shows only the real transfer leg
+        (with real duration/mode if RouteGeographyEngine resolved one,
+        honestly labeled "unavailable" if not) plus settle-in time and
+        dinner -- structurally identical to how the very first arrival
+        day of the whole trip is already (correctly) handled, extended
+        to include the flight/transfer segment itself as its own
+        explicit drawer so the traveler can see it's a travel day, not
+        a normal park day.
+
+        A transit day is by construction always also an arrival day
+        into the next destination (that's what triggered
+        LONG_TRANSFER classification in the first place) -- but this
+        method does not assume that; if is_arrival_day is somehow
+        False (defensive), it still produces an honest, minimal
+        transit-day shape rather than guessing.
+        """
+
+        order = 1
+
+        leg = None
+        if is_arrival_day and destination_index > 0 and destination_index - 1 < len(legs):
+            leg = legs[destination_index - 1]
+
+        mode = (leg or {}).get("mode") or "charter_flight"
+        duration_minutes = (leg or {}).get("duration_minutes")
+
+        transfer_description = _format_transfer_description(mode, duration_minutes)
+        effective_duration = (
+            duration_minutes if duration_minutes is not None else FALLBACK_TRANSIT_LEG_MINUTES
+        )
+
+        self._add_drawer(
+            shelf=shelf, name="Long-distance transfer",
+            description=transfer_description,
+            start_time=None, duration_minutes=effective_duration, sort_order=order,
+            activity_type="TRANSFER",
+            source=(leg.get("source") if leg else "fallback_estimate") or "fallback_estimate",
+            is_fallback=(duration_minutes is None),
+        )
+        order += 1
+
+        self._add_drawer(
+            shelf=shelf, name="Free time at the lodge",
+            description=(
+                "Most of this day is spent travelling between destinations. "
+                "No activity is scheduled so there is time to rest and "
+                "settle in on arrival."
+            ),
+            start_time=None, duration_minutes=180, sort_order=order,
+            activity_type="FREE_TIME", source="hardcoded_transit_day", is_fallback=True,
+        )
+        order += 1
+
+        self._add_drawer(
+            shelf=shelf, name="Dinner at the lodge", description=None,
+            start_time=None, duration_minutes=90, sort_order=order,
+            activity_type="MEAL", source="hardcoded_meal",
+        )
+
+        return None
+
+    def _populate_standard_day_drawers(
+        self, shelf: Shelf, pool: list[dict[str, Any]], cursor: dict[str, int],
+        fallback_counters: dict[str, int], dest_id: str, dest_type: str | None,
+        travel_style: list[str], day_number: int, is_arrival_day: bool,
+        origin_dest_id: str | None,
     ) -> str | None:
 
         order = 1
         first_activity_id: str | None = None
 
-        if is_first_day:
-            self._add_drawer(
-                shelf=shelf, name="Airport welcome",
-                description="Met at the airport by your driver-guide.",
-                start_time=DEFAULT_ARRIVAL_TIME, duration_minutes=60, sort_order=order,
-                activity_type="ARRIVAL", source="hardcoded_arrival_departure",
-            )
-            order += 1
-            self._add_drawer(
-                shelf=shelf, name="Transfer to lodge",
-                description="Transfer to the lodge. No excursion is assumed during this arrival transfer.",
-                start_time=dt_time(15, 30), duration_minutes=60, sort_order=order,
-                activity_type="TRANSFER", source="hardcoded_arrival_departure",
-            )
-            order += 1
-            self._add_drawer(
-                shelf=shelf, name="Dinner at the lodge", description=None,
-                start_time=dt_time(19, 30), duration_minutes=90, sort_order=order,
-                activity_type="MEAL", source="hardcoded_meal",
-            )
-            return None
-
-        if is_last_day:
-            self._add_drawer(
-                shelf=shelf, name="Breakfast", description=None,
-                start_time=dt_time(7, 0), duration_minutes=45, sort_order=order,
-                activity_type="MEAL", source="hardcoded_meal",
-            )
-            order += 1
-            self._add_drawer(
-                shelf=shelf, name="Transfer to airport", description=None,
-                start_time=dt_time(9, 0), duration_minutes=120, sort_order=order,
-                activity_type="TRANSFER", source="hardcoded_arrival_departure",
-            )
-            order += 1
-            self._add_drawer(
-                shelf=shelf, name="Departure", description=None,
-                start_time=dt_time(12, 0), duration_minutes=30, sort_order=order,
-                activity_type="DEPARTURE", source="hardcoded_arrival_departure",
-            )
-            return None
-
         if is_arrival_day:
-            order, transfer_end_minutes = self._destination_arrival_transfer(
+            order, _ = self._destination_arrival_transfer(
                 shelf=shelf, order=order, dest_id=dest_id, origin_dest_id=origin_dest_id,
             )
             order += 1
-        else:
-            transfer_end_minutes = None
 
-        # --- FIX: no independent morning slot on an arrival day ---
-        #
-        # Previously, `morning` was always populated here regardless
-        # of is_arrival_day, using _default_start_for(category) --
-        # which for a game_drive-category activity unconditionally
-        # returns 06:00, with no awareness that an "Arrival transfer"
-        # drawer was just scheduled for this same day (potentially
-        # starting at 14:00). That produced itineraries where a
-        # same-day activity was shown starting BEFORE the transfer
-        # that gets the traveler to the destination -- exactly the
-        # overlap ValidationEngine's _check_time_overlaps() exists to
-        # catch, but never avoided at construction time.
-        #
-        # An arrival day has no independent morning slot: the transfer
-        # occupies the morning by definition. So on an arrival day we
-        # skip the morning-activity block entirely -- `morning` stays
-        # None and NOTHING is consumed from `pool`/`cursor` for it.
-        # The activity that would have filled this slot remains at
-        # the front of the pool and is used for the afternoon slot
-        # below instead, so no seeded activity is silently dropped.
-        #
-        # On a non-arrival day, behavior is completely unchanged from
-        # before.
+        # On an arrival day there is no independent "morning slot" --
+        # the transfer occupies the morning. Nothing is consumed from
+        # pool/cursor for this slot; the activity that would have
+        # filled it is used for the afternoon/game-drive slot instead.
         if is_arrival_day:
             morning = None
         else:
@@ -819,28 +919,21 @@ class ItineraryPlanningEngine:
 
         if morning:
             first_activity_id = morning["id"]
+            morning_is_game_drive = _is_game_drive_category(morning["category"])
             self._add_drawer(
                 shelf=shelf, name=morning["name"], description=morning["description"],
-                start_time=_default_start_for(morning["category"]), duration_minutes=240,
+                start_time=(DEFAULT_GAME_DRIVE_START if morning_is_game_drive else None),
+                duration_minutes=240,
                 sort_order=order, activity_type="EXPERIENCE", activity_id=morning["id"],
                 source="activities_table",
             )
             order += 1
-            self._add_drawer(
-                shelf=shelf, name="Lunch at the lodge", description=None,
-                start_time=dt_time(13, 0), duration_minutes=60, sort_order=order,
-                activity_type="MEAL", source="hardcoded_meal",
-            )
-            order += 1
         elif not is_arrival_day:
-            # Non-arrival day with an exhausted pool: keep the
-            # previous fallback behavior exactly as it was (fallback
-            # drawer + lunch), unchanged.
             title, description = _fallback_drawer_text(dest_type, fallback_counters[dest_id])
             fallback_counters[dest_id] += 1
             self._add_drawer(
                 shelf=shelf, name=title, description=description,
-                start_time=_default_start_for(None), duration_minutes=180,
+                start_time=None, duration_minutes=180,
                 sort_order=order, activity_type="EXPERIENCE",
                 source="fallback_estimate", is_fallback=True,
             )
@@ -849,101 +942,33 @@ class ItineraryPlanningEngine:
                 day_number, dest_id,
             )
             order += 1
-            self._add_drawer(
-                shelf=shelf, name="Lunch at the lodge", description=None,
-                start_time=dt_time(13, 0), duration_minutes=60, sort_order=order,
-                activity_type="MEAL", source="hardcoded_meal",
-            )
-            order += 1
-        else:
-            # Arrival day: no morning activity drawer, but lunch is
-            # still served -- it's scheduled relative to the fixed
-            # LUNCH time regardless of the transfer, same as before.
-            # (If the transfer runs long enough to swallow lunch too,
-            # ValidationEngine's overlap check will still catch that
-            # as a genuine conflict -- that is a different, larger
-            # problem than this fix addresses, and correctly remains
-            # visible rather than silently patched over here.)
-            self._add_drawer(
-                shelf=shelf, name="Lunch at the lodge", description=None,
-                start_time=dt_time(13, 0), duration_minutes=60, sort_order=order,
-                activity_type="MEAL", source="hardcoded_meal",
-            )
-            order += 1
 
-        # --- Overlap-scheduling decision applied here ---
-        #
-        # On a non-arrival day, transfer_end_minutes is None and the
-        # afternoon slot keeps its normal fixed start. On an arrival
-        # day, the afternoon slot's start (and whether it exists at
-        # all) is derived from the transfer's actual measured end time
-        # rather than always assuming the fixed default -- this is
-        # what prevents the "Arrival transfer 14:00-19:00 overlaps
-        # Afternoon game drive 16:00" class of conflict that was
-        # previously only caught (and not always resolved) by
-        # ScheduleRepairEngine after the fact. UNCHANGED from the
-        # previous version of this file.
-        afternoon_start_minutes = self._minutes(AFTERNOON_SLOT_DEFAULT_START)
-        evening_start_minutes = self._minutes(EVENING_SLOT_START)
-        skip_afternoon_slot = False
+        # Lunch: sequenced by sort_order only, never by a clock-time
+        # comparison against the transfer -- since neither the
+        # transfer nor lunch now carries an absolute start_time, there
+        # is no arithmetic that can put lunch "before" a transfer that
+        # precedes it in sort_order. This is what closes out both the
+        # original "Game Drive 06:00 same day as Arrival 14:00" bug
+        # and the follow-up "Lunch 13:00 before Arrival transfer 14:00"
+        # bug -- both were only possible because absolute clock times
+        # existed to be compared incorrectly.
+        self._add_drawer(
+            shelf=shelf, name="Lunch at the lodge", description=None,
+            start_time=None, duration_minutes=60, sort_order=order,
+            activity_type="MEAL", source="hardcoded_meal",
+        )
+        order += 1
 
-        if transfer_end_minutes is not None:
-            candidate_start = transfer_end_minutes + POST_TRANSFER_BUFFER_MINUTES
-
-            if candidate_start >= evening_start_minutes - MIN_USABLE_AFTERNOON_MINUTES:
-                # The transfer alone consumes the useful afternoon.
-                # Do not fabricate an activity slot that couldn't
-                # actually happen -- drop it and be honest about why.
-                skip_afternoon_slot = True
-            else:
-                afternoon_start_minutes = max(afternoon_start_minutes, candidate_start)
-
-        if skip_afternoon_slot:
-            settling_in_start_minutes = transfer_end_minutes + POST_TRANSFER_BUFFER_MINUTES
-            settling_in_end_minutes = settling_in_start_minutes + 60
-
-            self._add_drawer(
-                shelf=shelf, name="Settling in after arrival",
-                description=(
-                    "The transfer into this destination takes up most of "
-                    "the afternoon. No activity is scheduled for this slot "
-                    "so there is time to settle in at the lodge."
-                ),
-                start_time=self._time_from_minutes(settling_in_start_minutes),
-                duration_minutes=60, sort_order=order, activity_type="EXPERIENCE",
-                source="hardcoded_long_transfer_arrival", is_fallback=True,
-            )
-            order += 1
-
-            # A long enough transfer can push "settling in" itself into
-            # or past the fixed evening slot. Rather than unconditionally
-            # adding a Sundowner at a fixed time regardless of what else
-            # already occupies that time (the original defect this whole
-            # rule exists to fix), skip it when it would collide -- the
-            # relaxed_pace preference is about not over-scheduling the
-            # evening, and a redundant "arrived late, still added a
-            # cocktail slot on top" entry works against that intent.
-            evening_slot_occupied = settling_in_end_minutes > evening_start_minutes
-
-            if "relaxed_pace" in travel_style and not evening_slot_occupied:
-                self._add_drawer(
-                    shelf=shelf, name="Sundowner at the lodge",
-                    description="Relaxed evening time at the lodge.",
-                    start_time=EVENING_SLOT_START, duration_minutes=60, sort_order=order,
-                    activity_type="EXPERIENCE", source="hardcoded_relaxed_pace", is_fallback=True,
-                )
-
-            return first_activity_id
-
-        afternoon_start = self._time_from_minutes(afternoon_start_minutes)
         afternoon = self._consume_next_activity(pool=pool, cursor=cursor, dest_id=dest_id)
 
         if afternoon:
             if first_activity_id is None:
                 first_activity_id = afternoon["id"]
+            afternoon_is_game_drive = _is_game_drive_category(afternoon["category"])
             self._add_drawer(
                 shelf=shelf, name=afternoon["name"], description=afternoon["description"],
-                start_time=afternoon_start, duration_minutes=150,
+                start_time=(EVENING_GAME_DRIVE_START if afternoon_is_game_drive else None),
+                duration_minutes=150,
                 sort_order=order, activity_type="EXPERIENCE", activity_id=afternoon["id"],
                 source="activities_table",
             )
@@ -952,7 +977,7 @@ class ItineraryPlanningEngine:
             fallback_counters[dest_id] += 1
             self._add_drawer(
                 shelf=shelf, name=title, description=description,
-                start_time=afternoon_start, duration_minutes=150,
+                start_time=None, duration_minutes=150,
                 sort_order=order, activity_type="EXPERIENCE", source="fallback_estimate", is_fallback=True,
             )
             logger.warning(
@@ -961,75 +986,30 @@ class ItineraryPlanningEngine:
             )
         order += 1
 
-        afternoon_end_minutes = afternoon_start_minutes + 150
-        evening_slot_occupied = afternoon_end_minutes > evening_start_minutes
-
-        if "relaxed_pace" in travel_style and not evening_slot_occupied:
+        if "relaxed_pace" in travel_style:
             self._add_drawer(
                 shelf=shelf, name="Sundowner at the lodge",
                 description="Relaxed evening time at the lodge.",
-                start_time=EVENING_SLOT_START, duration_minutes=60, sort_order=order,
+                start_time=None, duration_minutes=60, sort_order=order,
                 activity_type="EXPERIENCE", source="hardcoded_relaxed_pace", is_fallback=True,
             )
 
         return first_activity_id
 
-    @staticmethod
-    def _minutes(t: dt_time) -> int:
-        return t.hour * 60 + t.minute
-
-    @staticmethod
-    def _time_from_minutes(minutes: int) -> dt_time:
-        # Clamp to a valid time-of-day. A transfer that would push past
-        # midnight is a sign the itinerary needs a rest day or a split
-        # transfer, not something this method should silently wrap --
-        # clamping to 23:59 keeps the drawer constructible while
-        # ValidationEngine's overlap/long-transfer checks surface the
-        # underlying problem for a human to resolve.
-        minutes = max(0, min(minutes, 23 * 60 + 59))
-        return dt_time(minutes // 60, minutes % 60)
-
     def _destination_arrival_transfer(
         self, shelf: Shelf, order: int, dest_id: str, origin_dest_id: str | None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, bool]:
         """
-        Returns (order, transfer_end_minutes) so the caller can adapt
-        the rest of the day's schedule to the transfer's actual
-        duration rather than assuming a fixed default.
-
-        FIX (schema-mismatch decision, Option A -- see schema.sql
-        SECTION 4): this query now filters on BOTH from_destination_id
-        and to_destination_id, matching route_geography.py's directed
-        lookup. The previous version filtered only on the arrival
-        destination, ignoring which destination the traveler was
-        actually coming from -- meaning it could return a drive_times
-        row describing a completely different route into the same
-        destination. origin_dest_id is the destination immediately
-        before this one in the requested route order (see build()'s
-        main loop, where it is derived from destination_ids[index-1]).
-
-        If origin_dest_id is unavailable (should not normally happen
-        when is_arrival_day is True, since that flag itself implies a
-        previous destination exists -- but defended against rather
-        than assumed), no directed lookup is possible and this method
-        honestly falls through to the no-fabrication branch instead of
-        guessing at an undirected match.
+        Returns (order, transfer_leg_known) -- transfer_leg_known is
+        True when a real measured duration was found (used only for
+        logging/diagnostics now that no downstream clock-time
+        arithmetic depends on it; ordering is handled entirely by
+        sort_order per this rewrite's change (D)).
         """
 
         row = None
 
         if origin_dest_id is not None:
-            # FIX (real-schema alignment): queries
-            # drive_times_between_destinations, NOT drive_times.
-            # Supabase's existing drive_times table (see doc 18 / the
-            # production schema) models point-to-point drives WITHIN a
-            # single destination (park gate -> specific lodge, by free-
-            # text name) -- a genuinely different fact from an
-            # inter-destination transfer between two travel_places
-            # rows by UUID, which is what this method needs. See
-            # missing_tables.sql for the drive_times_between_destinations
-            # table definition and the full explanation of why these
-            # are not the same table.
             row = self.db.execute(
                 text(
                     """
@@ -1052,9 +1032,6 @@ class ItineraryPlanningEngine:
 
         duration = int(row[1]) if row and row[1] else None
 
-        # FIX (no-fabrication tolerance): honest description when
-        # duration is unavailable, rather than assuming a number for
-        # display purposes.
         if duration is not None:
             description = (
                 f"Transfer into the destination. Approximately "
@@ -1067,26 +1044,16 @@ class ItineraryPlanningEngine:
                 "placeholder duration is used for scheduling purposes only."
             )
 
-        # An unknown duration falls back to a conservative fixed
-        # estimate for SCHEDULING purposes (we still need some value to
-        # compute what comes after it in the day) -- but the persisted
-        # drawer's description and source are honest about this being
-        # unconfirmed, per the no-fabrication rule applied consistently
-        # with route_geography.py and the None-duration handling
-        # elsewhere in this file.
         effective_duration = duration if duration is not None else FALLBACK_ARRIVAL_TRANSFER_MINUTES
-
-        start_minutes = self._minutes(ARRIVAL_TRANSFER_START)
-        end_minutes = start_minutes + effective_duration
 
         self._add_drawer(
             shelf=shelf, name="Arrival transfer", description=description,
-            start_time=ARRIVAL_TRANSFER_START, duration_minutes=effective_duration,
+            start_time=None, duration_minutes=effective_duration,
             sort_order=order, activity_type="TRANSFER",
             source=("drive_times_between_destinations" if row and duration is not None else "fallback_estimate"),
             is_fallback=not bool(row and duration is not None),
         )
-        return order, end_minutes
+        return order, bool(row and duration is not None)
 
     @staticmethod
     def _consume_next_activity(pool: list[dict[str, Any]], cursor: dict[str, int], dest_id: str) -> dict[str, Any] | None:
@@ -1099,7 +1066,7 @@ class ItineraryPlanningEngine:
 
     @staticmethod
     def _add_drawer(
-        shelf: Shelf, name: str, description: str | None, start_time: dt_time,
+        shelf: Shelf, name: str, description: str | None, start_time: dt_time | None,
         duration_minutes: int, sort_order: int, activity_type: str,
         activity_id: Any = None, source: str = "activities_table", is_fallback: bool = False,
     ) -> Drawer:
@@ -1129,12 +1096,6 @@ class ItineraryPlanningEngine:
             to_country = meta.get(to, {}).get("country")
             is_inter_country = bool(from_country and to_country and from_country != to_country)
 
-            # FIX (real-schema alignment): queries
-            # drive_times_between_destinations, matching
-            # route_geography.py and the correction above in
-            # _destination_arrival_transfer. See that method's comment
-            # for why this is NOT the same table as Supabase's existing
-            # drive_times.
             drive_row = self.db.execute(
                 text(
                     """
@@ -1163,15 +1124,6 @@ class ItineraryPlanningEngine:
             if is_inter_country or (
                 duration_minutes is not None and duration_minutes > DRIVE_TO_FLIGHT_THRESHOLD_MINUTES
             ):
-                # FIX (real-schema alignment): doc 18's flights table
-                # allows EITHER an airport OR an airstrip as origin/
-                # destination (enforced by a CHECK constraint that
-                # exactly one of origin_airport_id/origin_airstrip_id
-                # is set, same for destination) -- a bush flight from a
-                # remote airstrip is a completely normal safari
-                # transfer and was previously invisible to this query,
-                # which only ever checked origin_airport_id /
-                # destination_airport_id. Now checks both.
                 flight_row = self.db.execute(
                     text(
                         """
@@ -1210,15 +1162,6 @@ class ItineraryPlanningEngine:
                 source = "flights_table"
                 distance_km = None
 
-            # FIX: no-fabrication tolerance. If neither drive nor
-            # flight data is available, we now leave duration_minutes
-            # and distance_km as None with source="unavailable"
-            # instead of substituting a fabricated placeholder
-            # (previously: 480min charter-flight guess, or 180min /
-            # 150km overland guess). This matches route_geography.py's
-            # honesty contract and is now handled downstream by
-            # ValidationEngine (warns rather than crashes) and the
-            # armrest/description formatting below.
             if duration_minutes is None:
                 mode = "charter_flight" if is_inter_country else "private_4x4"
                 source = "unavailable"
@@ -1260,11 +1203,6 @@ class ItineraryPlanningEngine:
             )
             self.db.add(hinge)
 
-            # FIX: same relationship-population issue as Shelf above --
-            # setting cabinet_id alone does not update cabinet.hinges in
-            # memory. Populate it explicitly so callers reading
-            # cabinet.hinges immediately after build() (e.g.
-            # itinerary_v2.py, ValidationEngine) see it correctly.
             if hasattr(hinge, "cabinet"):
                 hinge.cabinet = cabinet
             elif hinge not in cabinet.hinges:
@@ -1276,81 +1214,6 @@ class ItineraryPlanningEngine:
             })
 
         return legs
-
-    def _allocate_days(
-        self, destination_ids: list[str], meta: dict[str, dict[str, Any]],
-        total_days: int, travel_style: list[str],
-    ) -> tuple[list[int], list[str]]:
-
-        n = len(destination_ids)
-        if n == 0:
-            return [], []
-
-        if total_days < n:
-            allocation = [0] * n
-            for index in range(total_days):
-                allocation[index] = 1
-            return allocation, [
-                "Trip duration is shorter than the number of requested "
-                "destinations; only the first destinations can receive a day."
-            ]
-
-        allocation = [total_days // n] * n
-        remainder = total_days % n
-        for index in range(remainder):
-            allocation[index] += 1
-
-        warnings: list[str] = []
-
-        for i in range(1, n):
-            previous_destination = destination_ids[i - 1]
-            current_destination = destination_ids[i]
-            previous_country = meta.get(previous_destination, {}).get("country")
-            current_country = meta.get(current_destination, {}).get("country")
-
-            if not (previous_country and current_country and previous_country != current_country):
-                continue
-            if BORDER_BUFFER_NIGHTS <= 0:
-                continue
-
-            donor_candidates: list[tuple[int, int]] = []
-            for donor_index in range(n):
-                minimum = meta.get(destination_ids[donor_index], {}).get("min_nights", 1)
-                slack = allocation[donor_index] - minimum
-                # Confirmed fix (already present in this canonical
-                # version, preserved here): >= BORDER_BUFFER_NIGHTS,
-                # not > 0, so a destination can never be donated from
-                # below its recommended minimum.
-                if slack >= BORDER_BUFFER_NIGHTS:
-                    donor_candidates.append((slack, donor_index))
-
-            if not donor_candidates:
-                label = meta.get(current_destination, {}).get("headline_label", current_destination)
-                warnings.append(
-                    f"Could not add a border-buffer night before entering {label} "
-                    "without shortening another destination below its recommended "
-                    "minimum stay."
-                )
-                continue
-
-            _, donor_index = max(donor_candidates, key=lambda item: item[0])
-            if donor_index == i:
-                continue
-
-            allocation[donor_index] -= BORDER_BUFFER_NIGHTS
-            allocation[i] += BORDER_BUFFER_NIGHTS
-
-        if any(value < 0 for value in allocation):
-            logger.error("Negative day allocation detected: %s", allocation)
-            allocation = [max(0, value) for value in allocation]
-            while sum(allocation) < total_days:
-                allocation[-1] += 1
-
-        if sum(allocation) != total_days:
-            logger.error("Day allocation invariant violated: %s != %s", sum(allocation), total_days)
-            allocation[-1] += total_days - sum(allocation)
-
-        return allocation, warnings
 
     def _populate_headboard(self, shelf: Shelf, dest_id: str, budget_tier: str, remaining_nights_here: int) -> None:
         tier_map = {
@@ -1397,7 +1260,6 @@ class ItineraryPlanningEngine:
             minutes = leg["duration_minutes"]
             mode = leg.get("mode") or "private_4x4"
 
-            # FIX: honest formatting when minutes is None.
             description = _format_transfer_description(mode, minutes)
 
             armrest = Armrest(
@@ -1414,11 +1276,21 @@ class ItineraryPlanningEngine:
 
         self.db.add(armrest)
 
-    def _populate_trays(self, shelf: Shelf, is_first_day: bool, is_last_day: bool) -> None:
+    def _populate_trays(
+        self, shelf: Shelf, is_first_day: bool, is_last_day: bool, is_transit_day: bool,
+    ) -> None:
         if is_first_day:
             meals = ["dinner"]
         elif is_last_day:
             meals = ["breakfast"]
+        elif is_transit_day:
+            # Matches _populate_transit_day_drawers: only dinner is
+            # actually built as a drawer on a transit day (breakfast
+            # happened at the previous destination, lunch is
+            # consumed by travel time) -- the Tray records should
+            # reflect what's actually being served, not the full
+            # three-meal default.
+            meals = ["dinner"]
         else:
             meals = ["breakfast", "lunch", "dinner"]
 
@@ -1475,7 +1347,12 @@ class ItineraryPlanningEngine:
                 return
 
     @staticmethod
-    def _theme_for(idx: int, night_idx: int, is_first: bool, is_last: bool, destination_type: str | None) -> str:
+    def _theme_for(
+        idx: int, night_idx: int, is_first: bool, is_last: bool,
+        destination_type: str | None, is_transit_day: bool = False,
+    ) -> str:
+        if is_transit_day:
+            return "Travel day"
         if is_first:
             return "Arrival & slow start"
         if is_last:
