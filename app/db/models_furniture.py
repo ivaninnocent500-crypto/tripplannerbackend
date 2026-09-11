@@ -22,17 +22,22 @@ Four of that migration's five additions were already present here:
     drawers.is_fallback (Drawer)
 No changes needed for any of those — confirmed already correct.
 
-ONE genuine gap found and fixed: migration 005 also added
-`cabinets.traveler_nationality world_country_code` to the real
-database, but this ORM class had no matching attribute. Every
-`cabinet.traveler_nationality` reference in the rewritten
-app/api/trip_v2.py would raise AttributeError without this — the DB
-column existing doesn't make Python aware of it; SQLAlchemy only
-reads/writes columns explicitly declared on the class. Added below as
-plain `Text` (not a Postgres-enum-backed type on the ORM side) — the
-DB enforces the ISO-2 format via world_country_code's own
-`^[A-Z]{2}$` CHECK constraint; the ORM column only needs to pass a
-string through to it.
+ONE genuine gap found and fixed (prior rewrite): migration 005 also
+added `cabinets.traveler_nationality world_country_code` to the real
+database, but this ORM class had no matching attribute. Added as plain
+`Text` — the DB enforces the ISO-2 format via world_country_code's own
+CHECK constraint; the ORM column only needs to pass a string through.
+
+NEW IN THIS REWRITE: Shelf.day_kind, matching migration
+006_shelf_day_kind.sql. Backs the transit-day fix: a Shelf whose day
+is primarily consumed by a long-haul/intercontinental transfer is
+persisted as day_kind="TRANSIT" (default "STANDARD" for every other
+day), so ItineraryPlanningEngine can skip forcing an activity slot
+into that day and the Android client can render a distinct Travel Day
+card. Plain Text on the ORM side, matching the DB's own CHECK
+constraint (STANDARD|TRANSIT) rather than a SQLAlchemy Enum type — same
+convention already used for Cabinet.status and other check-constrained
+text columns in this file.
 
 Nothing else in this file changed from what you sent.
 """
@@ -78,7 +83,7 @@ class Cabinet(Base):
     status = Column(Text, nullable=False, default="draft")
     route_countries = Column(ARRAY(Text), nullable=False, default=list)
     primary_country = Column(Text)
-    # NEW — matches cabinets.traveler_nationality (world_country_code
+    # matches cabinets.traveler_nationality (world_country_code
     # domain) added by migration 005. Plain Text on the ORM side; the
     # DB's world_country_code CHECK constraint enforces the ISO-2
     # format. Written by app/api/trip_v2.py's generate_trip() from the
@@ -116,6 +121,14 @@ class Shelf(Base):
     destination_id = _uuid_fk("travel_places.id")
     theme = Column(Text)
     hero_image_url = Column(Text)
+    # NEW — matches shelves.day_kind (migration 006). "STANDARD"
+    # (default) for a normal itinerary day; "TRANSIT" for a day whose
+    # primary content is a long-haul/intercontinental transfer.
+    # ItineraryPlanningEngine sets this from the day's DayArchetype
+    # classification (LONG_TRANSFER) at construction time — see
+    # itineraryPlanningEngine.py's _populate_drawers(). The Android
+    # client reads this to decide which card template to render.
+    day_kind = Column(Text, nullable=False, default="STANDARD")
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
