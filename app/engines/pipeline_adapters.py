@@ -32,13 +32,57 @@ existing ORM state and RouteAnalysis output, and produces plain
 dict/dataclass values for the four planning engines to consume. That
 responsibility boundary matches the audit-locked architecture: the new
 engines return domain results, they do not touch persistence.
+
+CHANGE LOG (this rewrite -- transit-day fix, backend stage 1)
+--------------------------------------------------------------------
+PROBLEM BEING FIXED: DayArchetypeEngine (which classifies a day as
+LONG_TRANSFER when travel_hours crosses day_archetype.py's own
+LONG_TRAVEL_HOURS/VERY_LONG_TRAVEL_HOURS thresholds) previously ran
+AFTER ItineraryPlanningEngine.build() had already constructed every
+Drawer for every day -- including forcing a normal activity template
+(arrival transfer + lunch + an activity + sundowner) onto a day that
+was, in reality, consumed by an intercontinental flight (e.g.
+Tanzania -> Ethiopia, Tanzania -> Madagascar). The archetype
+classification existed but was computed too late to influence what got
+built; it was only ever used afterward, for ValidationEngine's
+warnings.
+
+ROOT CAUSE: day_records_from_route_analysis() (used to build
+DayArchetypeEngine's input) requires nights_per_destination, which was
+only known AFTER ItineraryPlanningEngine._allocate_days() ran --
+creating a real circular dependency (planning needs archetypes to
+avoid the transit-day bug; archetypes need day allocation; day
+allocation used to live inside planning).
+
+FIX: day-allocation logic is extracted out of ItineraryPlanningEngine
+entirely and into allocate_days_for_route() below -- a pure function
+with no DB access and no side effects, taking exactly the inputs
+ItineraryPlanningEngine._allocate_days() used to close over
+(destination_ids, per-destination meta, total_days, travel_style).
+This breaks the circular dependency: the orchestrator can now call
+allocate_days_for_route() first, feed its result into
+day_records_from_route_analysis() to get DayArchetypeEngine's
+classification, and THEN call ItineraryPlanningEngine.build() with
+that classification already available -- see itinerary_v2.py's
+reordered generate() method.
+
+ItineraryPlanningEngine.build() no longer performs its own day
+allocation; it accepts the already-computed allocation as a parameter.
+This is a deliberate responsibility move (planning engine no longer
+owns "how many nights per destination"), not a duplication -- the old
+_allocate_days() method's logic is preserved VERBATIM below, just
+relocated and stripped of its `self` dependency (it never used `self`
+for anything except being a method in the first place).
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Mapping
 
 from app.engines.route_geography import RouteAnalysis, RouteLeg
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -71,6 +115,114 @@ def hours_to_minutes(hours: float | None) -> int | None:
         return None
 
     return int(round(hours * 60))
+
+
+# ============================================================================
+# DAY ALLOCATION (extracted from ItineraryPlanningEngine -- see module
+# docstring for why)
+# ============================================================================
+
+# Preserved verbatim from ItineraryPlanningEngine's own module-level
+# constant. Kept here (not re-imported from itineraryPlanningEngine.py)
+# to avoid a reverse import (that module now imports FROM this one, for
+# allocate_days_for_route -- importing back would create a cycle).
+BORDER_BUFFER_NIGHTS = 1
+
+
+def allocate_days_for_route(
+    *,
+    destination_ids: list[str],
+    meta: dict[str, dict[str, Any]],
+    total_days: int,
+    travel_style: list[str],
+) -> tuple[list[int], list[str]]:
+    """
+    Decide how many nights each destination in the route receives,
+    given the trip's total day count.
+
+    This is the exact logic that previously lived as
+    ItineraryPlanningEngine._allocate_days() -- moved here unchanged
+    (aside from dropping `self`, which the original method never
+    actually used) so it can run BEFORE ItineraryPlanningEngine.build(),
+    breaking the circular dependency described in this module's
+    docstring. `meta` is the same per-destination metadata dict
+    ItineraryPlanningEngine._fetch_destination_meta() already produces
+    (country, headline_label, destination_type, min_nights) --
+    callers should fetch that first and pass it in unchanged.
+
+    `travel_style` is accepted for signature compatibility with the
+    original method (and in case a future revision wants to factor it
+    into allocation) but is not currently read by the allocation logic
+    itself -- same as before this extraction.
+    """
+
+    n = len(destination_ids)
+    if n == 0:
+        return [], []
+
+    if total_days < n:
+        allocation = [0] * n
+        for index in range(total_days):
+            allocation[index] = 1
+        return allocation, [
+            "Trip duration is shorter than the number of requested "
+            "destinations; only the first destinations can receive a day."
+        ]
+
+    allocation = [total_days // n] * n
+    remainder = total_days % n
+    for index in range(remainder):
+        allocation[index] += 1
+
+    warnings: list[str] = []
+
+    for i in range(1, n):
+        previous_destination = destination_ids[i - 1]
+        current_destination = destination_ids[i]
+        previous_country = meta.get(previous_destination, {}).get("country")
+        current_country = meta.get(current_destination, {}).get("country")
+
+        if not (previous_country and current_country and previous_country != current_country):
+            continue
+        if BORDER_BUFFER_NIGHTS <= 0:
+            continue
+
+        donor_candidates: list[tuple[int, int]] = []
+        for donor_index in range(n):
+            minimum = meta.get(destination_ids[donor_index], {}).get("min_nights", 1)
+            slack = allocation[donor_index] - minimum
+            # >= BORDER_BUFFER_NIGHTS, not > 0, so a destination can
+            # never be donated from below its recommended minimum.
+            if slack >= BORDER_BUFFER_NIGHTS:
+                donor_candidates.append((slack, donor_index))
+
+        if not donor_candidates:
+            label = meta.get(current_destination, {}).get("headline_label", current_destination)
+            warnings.append(
+                f"Could not add a border-buffer night before entering {label} "
+                "without shortening another destination below its recommended "
+                "minimum stay."
+            )
+            continue
+
+        _, donor_index = max(donor_candidates, key=lambda item: item[0])
+        if donor_index == i:
+            continue
+
+        allocation[donor_index] -= BORDER_BUFFER_NIGHTS
+        allocation[i] += BORDER_BUFFER_NIGHTS
+
+    if any(value < 0 for value in allocation):
+        logger.error("Negative day allocation detected: %s", allocation)
+        allocation = [max(0, value) for value in allocation]
+        while sum(allocation) < total_days:
+            allocation[-1] += 1
+
+    if sum(allocation) != total_days:
+        logger.error("Day allocation invariant violated: %s != %s", sum(allocation), total_days)
+        allocation[-1] += total_days - sum(allocation)
+
+    return allocation, warnings
 
 
 # ============================================================================
@@ -147,10 +299,23 @@ def day_records_from_route_analysis(
     - the RouteGeographyEngine's analysis of the destination route
       (which produces one RouteLeg per destination-to-destination
       transition, NOT one per day),
-    - how many nights ItineraryPlanningEngine._allocate_days() assigned
-      to each destination in order,
+    - how many nights were allocated to each destination in order
+      (from allocate_days_for_route(), called by the orchestrator
+      BEFORE ItineraryPlanningEngine.build() -- see this module's
+      docstring for why that ordering changed),
     - and, optionally, per-day activity counts (day_number -> count) if
       already known; days not present default to 0.
+
+    NOTE ON activity_counts_by_day: since this function can now run
+    BEFORE ItineraryPlanningEngine.build() has constructed any Drawers,
+    callers invoking it pre-planning should simply omit this parameter
+    (every day defaults to activity_count=0) -- day_archetype.py's
+    classify_day() does not require a non-zero activity_count to
+    correctly detect LONG_TRANSFER; that classification is driven by
+    travel_hours/transfer flags from the leg data, not by activity
+    counts. activity_counts_by_day remains available for any caller
+    that wants to re-classify AFTER planning (e.g. for a post-hoc
+    ValidationEngine pass) with real counts.
 
     The mapping from "N legs between destinations" to "1 day per
     calendar day" is: the leg immediately preceding a destination lands
@@ -242,6 +407,43 @@ def overnight_required_from_day_plan(day_plan) -> dict[int, bool]:
         day.day_number: (
             day.archetype.value not in _ARCHETYPES_WITHOUT_OVERNIGHT_REQUIREMENT
         )
+        for day in day_plan.days
+    }
+
+
+# ============================================================================
+# DAY ARCHETYPE OUTPUT -> ITINERARY PLANNING ENGINE INPUT (transit days)
+# ============================================================================
+
+# Archetypes that mean "this day's primary content is a long-haul
+# transfer" -- ItineraryPlanningEngine uses this mapping to decide
+# whether to build the normal activity template for a day or the
+# TRANSIT-day template (no forced activity slot; see
+# itineraryPlanningEngine.py's _populate_drawers()). Sourced from
+# day_archetype.py's own DayArchetype enum -- LONG_TRANSFER is the
+# archetype classify_day() assigns when travel_hours crosses that
+# module's LONG_TRAVEL_HOURS/VERY_LONG_TRAVEL_HOURS thresholds. No new
+# thresholds are introduced here; this is purely a lookup of an
+# already-computed classification.
+_ARCHETYPES_REQUIRING_TRANSIT_DAY = frozenset({"long_transfer"})
+
+
+def transit_days_from_day_plan(day_plan) -> dict[int, bool]:
+    """
+    Build a day_number -> is_transit_day mapping from a
+    day_archetype.DayArchetypePlan, for ItineraryPlanningEngine.build()
+    to consult when constructing each Shelf's drawers.
+
+    A day not present in day_plan (should not normally happen -- every
+    day the orchestrator allocates is classified) is treated as NOT a
+    transit day by the caller's default handling (see
+    itineraryPlanningEngine.py: `.get(day_number, False)`), matching
+    the same "unknown defaults to the conservative/existing behavior"
+    convention used by overnight_required_from_day_plan above.
+    """
+
+    return {
+        day.day_number: (day.archetype.value in _ARCHETYPES_REQUIRING_TRANSIT_DAY)
         for day in day_plan.days
     }
 
@@ -347,12 +549,13 @@ def archetypes_by_day_number(day_plan) -> dict[int, Any]:
 __all__ = [
     "minutes_to_hours",
     "hours_to_minutes",
+    "allocate_days_for_route",
     "day_record_from_route_leg",
     "day_records_from_route_analysis",
     "overnight_required_from_day_plan",
+    "transit_days_from_day_plan",
     "activity_record_from_drawer",
     "schedule_record_from_shelf",
     "schedule_input_from_cabinet",
     "archetypes_by_day_number",
 ]
-
