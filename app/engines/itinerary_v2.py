@@ -281,40 +281,20 @@ class ItineraryOrchestrator:
         )
         result.warnings.extend(allocation_warnings)
 
-        day_records = day_records_from_route_analysis(
+       day_records = day_records_from_route_analysis(
             route_analysis=route_analysis,
             destination_order=cleaned_destination_ids,
             nights_per_destination=day_allocation,
             total_days=total_days,
-            # activity_counts_by_day intentionally omitted -- this
-            # runs BEFORE any Drawer exists, so there is nothing to
-            # count yet. See day_records_from_route_analysis()'s
-            # docstring: LONG_TRANSFER classification does not depend
-            # on activity counts, only on travel_hours/transfer flags
-            # already present in route_analysis.
         )
 
-      pre_planning_day_plan = self.day_archetype_engine.analyze(day_records)
-
-        # Route-aware transit detection must use the original day
-        # records, not only the DayArchetype classification.
-        #
-        # This matters when a real destination transition exists but
-        # RouteGeographyEngine has no measured duration.
-        #
-        # Example:
-        # Ngorongoro -> Pyramids
-        # duration = None
-        #
-        # DayArchetype cannot classify that as LONG_TRANSFER because
-        # travel_hours is necessarily 0.0 at its numeric boundary.
-        # The route-aware adapter still knows that this is a genuine
-        # destination transition and therefore marks the day TRANSIT.
+        pre_planning_day_plan = self.day_archetype_engine.analyze(day_records)
 
         transit_days = transit_days_from_day_plan(
             pre_planning_day_plan,
             day_records=day_records,
         )
+
 
         # --- Planning, now transit-day-aware at construction time ---
 
