@@ -5,24 +5,31 @@ Pipeline Adapters
 Translation layer between persistence-facing engines and the pure,
 DB-free planning engines.
 
-Important architecture rule
+Responsibilities
+----------------
+1. Convert route facts into planning records.
+2. Allocate days across destinations.
+3. Determine whether a requested destination sequence can coherently
+   fit inside the requested trip duration.
+4. Determine TRANSIT days without confusing every destination change
+   with a travel day.
+
+Important architecture rules
 ----------------------------
-A route transition and a transit-day decision are two different facts.
 
-A destination can change without consuming the calendar day as a
-dedicated TRANSIT day.
+A destination transition and a TRANSIT day are different concepts.
 
-Examples:
+Example:
 
     Serengeti -> Ngorongoro
         same country
-        normal safari routing
-        duration may be known or unknown
+        normal safari movement
+        short/unknown duration
         -> NOT automatically TRANSIT
 
     Ngorongoro -> Pyramids
         different country
-        international transition
+        international movement
         duration may be unknown
         -> TRANSIT
 
@@ -30,11 +37,15 @@ Examples:
         measured long travel
         -> TRANSIT
 
-The adapter must NOT fabricate a duration when the route duration
-is unavailable.
+A route duration must never be fabricated.
 
-The raw RouteLeg remains attached so downstream code can distinguish
-known travel from unknown travel.
+Feasibility is also separate from transit classification.
+
+A trip can contain a destination transition without that transition
+consuming an entire calendar day.
+
+However, a destination should not receive an artificially tiny stay
+just to make the arithmetic equal the requested number of days.
 
 No ORM records are created here.
 """
@@ -42,6 +53,7 @@ No ORM records are created here.
 from __future__ import annotations
 
 import logging
+from itertools import combinations
 from typing import Any, Mapping
 
 from app.engines.route_geography import RouteAnalysis, RouteLeg
@@ -50,12 +62,21 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# TRANSIT RULES
+# CONSTANTS
 # ============================================================================
 
-# A measured route consuming approximately half a day or more is treated
-# as a dedicated transit day.
+# A measured route consuming approximately half a day or more becomes
+# a dedicated TRANSIT day.
 TRANSIT_TRAVEL_THRESHOLD_HOURS = 6.0
+
+# Used only when a destination has no meaningful minimum-stay metadata.
+#
+# This is intentionally conservative. It prevents a destination from
+# receiving a meaningless one-day visit simply because its database
+# minimum is missing.
+DEFAULT_MIN_NIGHTS = 2
+
+BORDER_BUFFER_NIGHTS = 1
 
 
 # ============================================================================
@@ -89,11 +110,353 @@ def hours_to_minutes(hours: float | None) -> int | None:
 
 
 # ============================================================================
-# DAY ALLOCATION
+# DESTINATION FEASIBILITY
 # ============================================================================
 
-BORDER_BUFFER_NIGHTS = 1
+def destination_min_nights(
+    destination_id: str,
+    meta: dict[str, dict[str, Any]],
+) -> int:
+    """
+    Return the minimum meaningful stay for a destination.
 
+    The database value is authoritative when present.
+
+    If the metadata does not contain a valid minimum, use a conservative
+    default rather than allowing the destination to receive a meaningless
+    one-night allocation.
+    """
+
+    raw_value = meta.get(
+        destination_id,
+        {},
+    ).get("min_nights")
+
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = DEFAULT_MIN_NIGHTS
+
+    return max(1, value)
+
+
+def route_transition_consumes_day(
+    leg: RouteLeg | None,
+) -> bool:
+    """
+    Decide whether a route leg itself consumes a dedicated calendar day.
+
+    This is deliberately stricter than merely checking whether a
+    destination changes.
+
+    Rules:
+
+        cross-country -> yes
+
+        measured travel >= 6h -> yes
+
+        unknown same-country route -> no
+
+        short same-country route -> no
+    """
+
+    if leg is None:
+        return False
+
+    if bool(leg.is_inter_country):
+        return True
+
+    if leg.duration_minutes is None:
+        return False
+
+    return (
+        minutes_to_hours(leg.duration_minutes)
+        >= TRANSIT_TRAVEL_THRESHOLD_HOURS
+    )
+
+
+def route_transition_days(
+    *,
+    route_analysis: RouteAnalysis,
+    destination_order: list[str],
+) -> int:
+    """
+    Count route transitions that consume dedicated calendar days.
+
+    A normal short same-country movement does not consume a dedicated
+    calendar day.
+
+    This prevents:
+
+        Tarangire -> Zanzibar
+
+    from automatically consuming a full travel day merely because
+    the destination changes.
+
+    Conversely:
+
+        Ngorongoro -> Pyramids
+
+    is counted when RouteGeographyEngine identifies it as an
+    inter-country transition.
+    """
+
+    if len(destination_order) <= 1:
+        return 0
+
+    legs_by_destination: dict[str, RouteLeg] = {
+        leg.to_stop.destination_id: leg
+        for leg in route_analysis.legs
+    }
+
+    transition_days = 0
+
+    for destination_id in destination_order[1:]:
+        leg = legs_by_destination.get(destination_id)
+
+        if route_transition_consumes_day(leg):
+            transition_days += 1
+
+    return transition_days
+
+
+def minimum_days_required_for_route(
+    *,
+    destination_order: list[str],
+    meta: dict[str, dict[str, Any]],
+    route_analysis: RouteAnalysis | None = None,
+) -> int:
+    """
+    Calculate the minimum coherent trip duration for a destination route.
+
+    The calculation is:
+
+        destination minimum stays
+        +
+        dedicated long/international transition days
+
+    A normal short destination transfer does NOT automatically add
+    a full day.
+
+    Example:
+
+        Tarangire min 2
+        Zanzibar min 2
+        Lalibela min 2
+        Tsingy min 2
+
+        = 8 minimum destination days
+
+    If an additional route transition consumes a dedicated day, that
+    day is added separately.
+
+    The function never invents a route duration.
+    """
+
+    if not destination_order:
+        return 0
+
+    destination_days = sum(
+        destination_min_nights(
+            destination_id,
+            meta,
+        )
+        for destination_id in destination_order
+    )
+
+    transition_days = 0
+
+    if route_analysis is not None:
+        transition_days = route_transition_days(
+            route_analysis=route_analysis,
+            destination_order=destination_order,
+        )
+
+    return destination_days + transition_days
+
+
+def _route_subset_score(
+    subset: tuple[str, ...],
+    *,
+    original_order: list[str],
+    meta: dict[str, dict[str, Any]],
+) -> tuple[int, int, int]:
+    """
+    Score a feasible destination subset.
+
+    Higher is better.
+
+    Priority:
+
+        1. More destinations retained.
+        2. More total minimum-stay nights retained.
+        3. Preserve earlier destinations in the user's requested order.
+
+    This is intentionally deterministic.
+    """
+
+    retained_count = len(subset)
+
+    retained_min_nights = sum(
+        destination_min_nights(
+            destination_id,
+            meta,
+        )
+        for destination_id in subset
+    )
+
+    original_positions = [
+        original_order.index(destination_id)
+        for destination_id in subset
+    ]
+
+    # Earlier requested destinations receive a slightly stronger score.
+    position_score = sum(
+        len(original_order) - position
+        for position in original_positions
+    )
+
+    return (
+        retained_count,
+        retained_min_nights,
+        position_score,
+    )
+
+
+def find_feasible_destination_order(
+    *,
+    destination_ids: list[str],
+    meta: dict[str, dict[str, Any]],
+    total_days: int,
+    route_analysis: RouteAnalysis | None = None,
+) -> tuple[list[str], list[str]]:
+    """
+    Find the largest coherent destination subset that fits the requested
+    number of days.
+
+    IMPORTANT
+    ---------
+    This function does NOT blindly squeeze every requested destination
+    into the trip.
+
+    If four destinations cannot coherently fit into seven days, it keeps
+    the largest feasible subset instead of generating meaningless
+    one-day stays everywhere.
+
+    The original destination order is preserved.
+
+    Returns:
+
+        feasible_destination_order
+        warnings
+    """
+
+    cleaned = list(
+        dict.fromkeys(
+            str(destination_id)
+            for destination_id in destination_ids
+            if destination_id
+        )
+    )
+
+    if not cleaned:
+        return [], []
+
+    if total_days <= 0:
+        return cleaned, [
+            "Trip duration is not valid; destination feasibility "
+            "cannot be evaluated."
+        ]
+
+    minimum_required = minimum_days_required_for_route(
+        destination_order=cleaned,
+        meta=meta,
+        route_analysis=route_analysis,
+    )
+
+    if minimum_required <= total_days:
+        return cleaned, []
+
+    warnings: list[str] = [
+        (
+            f"Requested route requires at least {minimum_required} "
+            f"coherent days, but the trip contains only {total_days} days. "
+            "The destination sequence must be reduced."
+        )
+    ]
+
+    # Search largest feasible subset.
+    #
+    # The number of requested destinations is normally small, so this
+    # deterministic subset search is preferable to arbitrary removal.
+    best_subset: tuple[str, ...] | None = None
+    best_score: tuple[int, int, int] | None = None
+
+    for subset_size in range(
+        min(len(cleaned), total_days),
+        0,
+        -1,
+    ):
+        feasible_subsets: list[
+            tuple[str, ...]
+        ] = []
+
+        for indexes in combinations(
+            range(len(cleaned)),
+            subset_size,
+        ):
+            subset = tuple(
+                cleaned[index]
+                for index in indexes
+            )
+
+            required_days = minimum_days_required_for_route(
+                destination_order=list(subset),
+                meta=meta,
+                route_analysis=route_analysis,
+            )
+
+            if required_days <= total_days:
+                feasible_subsets.append(subset)
+
+        if feasible_subsets:
+            best_subset = max(
+                feasible_subsets,
+                key=lambda subset: _route_subset_score(
+                    subset,
+                    original_order=cleaned,
+                    meta=meta,
+                ),
+            )
+
+            break
+
+    if best_subset is None:
+        # At least one destination should always fit because its minimum
+        # stay is clamped to >= 1.
+        best_subset = (
+            cleaned[0],
+        )
+
+    removed = [
+        destination_id
+        for destination_id in cleaned
+        if destination_id not in best_subset
+    ]
+
+    if removed:
+        warnings.append(
+            "The following destinations were removed from the generated "
+            f"route because they could not fit coherently into "
+            f"{total_days} days: {', '.join(removed)}."
+        )
+
+    return list(best_subset), warnings
+
+
+# ============================================================================
+# DAY ALLOCATION
+# ============================================================================
 
 def allocate_days_for_route(
     *,
@@ -101,12 +464,19 @@ def allocate_days_for_route(
     meta: dict[str, dict[str, Any]],
     total_days: int,
     travel_style: list[str],
+    route_analysis: RouteAnalysis | None = None,
 ) -> tuple[list[int], list[str]]:
     """
-    Decide how many nights each destination receives.
+    Allocate calendar days across a destination route.
 
-    This is the extracted allocation logic formerly owned by
-    ItineraryPlanningEngine._allocate_days().
+    The allocation starts from each destination's meaningful minimum stay.
+
+    Remaining days are distributed across destinations.
+
+    Dedicated transition days are reserved where RouteGeographyEngine
+    provides an actual cross-country or >=6-hour route.
+
+    This function assumes destination feasibility has already been checked.
     """
 
     n = len(destination_ids)
@@ -122,23 +492,98 @@ def allocate_days_for_route(
 
         return allocation, [
             "Trip duration is shorter than the number of requested "
-            "destinations; only the first destinations can receive a day."
+            "destinations."
         ]
 
-    allocation = [total_days // n] * n
-    remainder = total_days % n
+    minimums = [
+        destination_min_nights(
+            destination_id,
+            meta,
+        )
+        for destination_id in destination_ids
+    ]
 
-    for index in range(remainder):
-        allocation[index] += 1
+    transition_days_by_index = [0] * n
+
+    if route_analysis is not None:
+        legs_by_destination: dict[str, RouteLeg] = {
+            leg.to_stop.destination_id: leg
+            for leg in route_analysis.legs
+        }
+
+        for index in range(1, n):
+            destination_id = destination_ids[index]
+
+            leg = legs_by_destination.get(
+                destination_id
+            )
+
+            if route_transition_consumes_day(leg):
+                transition_days_by_index[index] = 1
 
     warnings: list[str] = []
 
+    reserved_transition_days = sum(
+        transition_days_by_index
+    )
+
+    destination_day_budget = (
+        total_days - reserved_transition_days
+    )
+
+    required_destination_days = sum(
+        minimums
+    )
+
+    if destination_day_budget < required_destination_days:
+        warnings.append(
+            "Destination minimum stays plus required route transition "
+            "days exceed the requested trip duration."
+        )
+
+        # Defensive fallback. Feasibility should normally have removed
+        # excess destinations before this point.
+        allocation = minimums[:]
+
+        while (
+            sum(allocation)
+            + reserved_transition_days
+            < total_days
+        ):
+            allocation[-1] += 1
+
+        return allocation, warnings
+
+    allocation = minimums[:]
+
+    remaining = (
+        destination_day_budget
+        - required_destination_days
+    )
+
+    # Distribute remaining days according to a relaxed travel style.
+    # For now the allocation remains deterministic and balanced.
+    index = 0
+
+    while remaining > 0:
+        allocation[index % n] += 1
+        remaining -= 1
+        index += 1
+
+    # Border-buffer logic.
     for i in range(1, n):
         previous_destination = destination_ids[i - 1]
         current_destination = destination_ids[i]
 
-        previous_country = meta.get(previous_destination, {}).get("country")
-        current_country = meta.get(current_destination, {}).get("country")
+        previous_country = meta.get(
+            previous_destination,
+            {},
+        ).get("country")
+
+        current_country = meta.get(
+            current_destination,
+            {},
+        ).get("country")
 
         if not (
             previous_country
@@ -153,16 +598,19 @@ def allocate_days_for_route(
         donor_candidates: list[tuple[int, int]] = []
 
         for donor_index in range(n):
-            minimum = meta.get(
-                destination_ids[donor_index],
-                {},
-            ).get("min_nights", 1)
+            minimum = minimums[donor_index]
 
-            slack = allocation[donor_index] - minimum
+            slack = (
+                allocation[donor_index]
+                - minimum
+            )
 
             if slack >= BORDER_BUFFER_NIGHTS:
                 donor_candidates.append(
-                    (slack, donor_index)
+                    (
+                        slack,
+                        donor_index,
+                    )
                 )
 
         if not donor_candidates:
@@ -192,28 +640,36 @@ def allocate_days_for_route(
         allocation[donor_index] -= BORDER_BUFFER_NIGHTS
         allocation[i] += BORDER_BUFFER_NIGHTS
 
-    if any(value < 0 for value in allocation):
+    # Final invariant.
+    expected_destination_days = (
+        total_days - reserved_transition_days
+    )
+
+    if sum(allocation) != expected_destination_days:
         logger.error(
-            "Negative day allocation detected: %s",
+            "Destination allocation invariant violated: "
+            "%s != %s",
+            sum(allocation),
+            expected_destination_days,
+        )
+
+        difference = (
+            expected_destination_days
+            - sum(allocation)
+        )
+
+        allocation[-1] += difference
+
+    if any(value < 1 for value in allocation):
+        logger.error(
+            "Invalid destination allocation generated: %s",
             allocation,
         )
 
         allocation = [
-            max(0, value)
+            max(1, value)
             for value in allocation
         ]
-
-        while sum(allocation) < total_days:
-            allocation[-1] += 1
-
-    if sum(allocation) != total_days:
-        logger.error(
-            "Day allocation invariant violated: %s != %s",
-            sum(allocation),
-            total_days,
-        )
-
-        allocation[-1] += total_days - sum(allocation)
 
     return allocation, warnings
 
@@ -233,43 +689,6 @@ def day_record_from_route_leg(
     activity_count: int,
     destination_type: str | None,
 ) -> dict[str, Any]:
-    """
-    Build one DayArchetype-compatible record.
-
-    IMPORTANT
-    ---------
-    A destination transition does NOT automatically mean the calendar
-    day is a TRANSIT day.
-
-    The route facts are kept separately:
-
-        is_destination_transition
-        route_duration_available
-        travel_hours
-        crosses_country
-        requires_transit_day
-
-    Transit-day semantics:
-
-        1. Cross-country/international transition
-           -> TRANSIT
-
-        2. Measured travel >= 6 hours
-           -> TRANSIT
-
-        3. Same-country destination transition below 6 hours
-           -> NOT automatically TRANSIT
-
-        4. Unknown-duration same-country transition
-           -> NOT automatically TRANSIT
-
-    This prevents normal safari routing such as:
-
-        Serengeti -> Ngorongoro
-
-    from becoming a dedicated travel day merely because the destination
-    changed.
-    """
 
     record: dict[str, Any] = {
         "day_number": day_number,
@@ -277,7 +696,6 @@ def day_record_from_route_leg(
         "departure": is_last_day,
         "destination_type": destination_type,
         "activity_count": activity_count,
-
         "is_destination_transition": False,
         "route_duration_available": False,
         "route_unavailable": False,
@@ -297,81 +715,37 @@ def day_record_from_route_leg(
             leg.is_inter_country
         )
 
-        # ---------------------------------------------------------------
-        # Transit decision
-        # ---------------------------------------------------------------
-        #
-        # DO NOT use:
-        #
-        # is_destination_transition = True
-        #
-        # as the transit criterion.
-        #
-        # A destination change is only a route fact.
-        #
-        # A TRANSIT day requires either:
-        #
-        # - an international/cross-country transition, OR
-        # - measured travel that consumes >= 6 hours.
-        #
-        # Therefore:
-        #
-        # Serengeti -> Ngorongoro
-        # crosses_country = False
-        # travel < 6h OR unavailable
-        # -> STANDARD
-        #
-        # Ngorongoro -> Pyramids
-        # crosses_country = True
-        # -> TRANSIT
-        #
         requires_transit_day = (
             crosses_country
             or (
                 duration_available
-                and travel_hours >= TRANSIT_TRAVEL_THRESHOLD_HOURS
+                and travel_hours
+                >= TRANSIT_TRAVEL_THRESHOLD_HOURS
             )
         )
 
         record.update(
             {
                 "transfer": True,
-
                 "travel_hours": travel_hours,
-
                 "travel_distance_km": (
                     leg.distance_km
                     if leg.distance_km is not None
                     else 0.0
                 ),
-
                 "crosses_country": crosses_country,
-
                 "border_crossing": bool(
                     leg.requires_border_crossing
                 ),
-
-                # A route transition exists independently from whether
-                # it consumes the day as TRANSIT.
                 "is_destination_transition": True,
-
                 "route_duration_available": duration_available,
-
                 "route_unavailable": not duration_available,
-
-                # This is the actual Shelf.day_kind decision.
                 "requires_transit_day": requires_transit_day,
-
-                # Preserve authoritative route information.
                 "_route_leg": leg,
             }
         )
 
         return record
-
-    # ------------------------------------------------------------------
-    # No destination-to-destination route leg.
-    # ------------------------------------------------------------------
 
     record.update(
         {
@@ -380,14 +754,10 @@ def day_record_from_route_leg(
             "travel_distance_km": 0.0,
             "crosses_country": False,
             "border_crossing": False,
-
             "is_destination_transition": False,
-
             "route_duration_available": False,
             "route_unavailable": False,
-
             "requires_transit_day": False,
-
             "_route_leg": None,
         }
     )
@@ -407,21 +777,6 @@ def day_records_from_route_analysis(
     total_days: int,
     activity_counts_by_day: Mapping[int, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """
-    Build one ordered day record for every itinerary day.
-
-    The route leg between destination A and destination B is attached
-    to the FIRST calendar day allocated to destination B.
-
-    Important:
-
-        A route leg means a destination transition exists.
-
-        It does NOT automatically mean that day is TRANSIT.
-
-    The final transit decision is made by day_record_from_route_leg()
-    using cross-country status and measured travel duration.
-    """
 
     if len(destination_order) != len(nights_per_destination):
         raise ValueError(
@@ -432,7 +787,6 @@ def day_records_from_route_analysis(
 
     activity_counts = activity_counts_by_day or {}
 
-    # One leg per consecutive destination transition.
     leg_by_arrival_destination: dict[str, RouteLeg] = {
         leg.to_stop.destination_id: leg
         for leg in route_analysis.legs
@@ -473,25 +827,24 @@ def day_records_from_route_analysis(
                 else None
             )
 
-            record = day_record_from_route_leg(
-                day_number=day_number,
-                total_days=total_days,
-                is_first_day=is_first_day,
-                is_last_day=is_last_day,
-                is_arrival_day=is_arrival_day,
-                leg=leg,
-                activity_count=activity_counts.get(
-                    day_number,
-                    0,
-                ),
-                destination_type=destination_types.get(
-                    destination_id
-                ),
+            records.append(
+                day_record_from_route_leg(
+                    day_number=day_number,
+                    total_days=total_days,
+                    is_first_day=is_first_day,
+                    is_last_day=is_last_day,
+                    is_arrival_day=is_arrival_day,
+                    leg=leg,
+                    activity_count=activity_counts.get(
+                        day_number,
+                        0,
+                    ),
+                    destination_type=destination_types.get(
+                        destination_id
+                    ),
+                )
             )
 
-            records.append(record)
-
-    # Defensive invariant.
     if len(records) != total_days:
         raise ValueError(
             "Generated day records do not match total_days: "
@@ -502,67 +855,33 @@ def day_records_from_route_analysis(
 
 
 # ============================================================================
-# EXPLICIT TRANSIT-DAY EXTRACTION
+# TRANSIT-DAY EXTRACTION
 # ============================================================================
 
 def transit_days_from_day_records(
     day_records: list[Mapping[str, Any]],
 ) -> dict[int, bool]:
-    """
-    Extract the authoritative transit-day decision from route-aware
-    day records.
 
-    This is intentionally independent of DayArchetype.
-
-    DayArchetype answers:
-
-        "What kind of day is this?"
-
-    Transit persistence answers:
-
-        "Should this Shelf be persisted as TRANSIT?"
-
-    The route-aware decision is:
-
-        cross-country -> TRANSIT
-
-        OR
-
-        measured travel >= 6h -> TRANSIT
-
-        otherwise -> STANDARD
-
-    A destination transition alone is NOT enough.
-    """
-
-    transit_days: dict[int, bool] = {}
-
-    for record in day_records:
-        day_number = record.get("day_number")
-
-        if day_number is None:
-            continue
-
-        transit_days[int(day_number)] = bool(
-            record.get("requires_transit_day", False)
+    return {
+        int(record["day_number"]): bool(
+            record.get(
+                "requires_transit_day",
+                False,
+            )
         )
+        for record in day_records
+        if record.get("day_number") is not None
+    }
 
-    return transit_days
-
-
-# ============================================================================
-# DAY ARCHETYPE OUTPUT -> VALIDATION ENGINE INPUT
-# ============================================================================
 
 _ARCHETYPES_WITHOUT_OVERNIGHT_REQUIREMENT = frozenset(
     {"departure"}
 )
 
 
-def overnight_required_from_day_plan(day_plan) -> dict[int, bool]:
-    """
-    Build the overnight_required mapping consumed by ValidationEngine.
-    """
+def overnight_required_from_day_plan(
+    day_plan,
+) -> dict[int, bool]:
 
     return {
         day.day_number: (
@@ -572,10 +891,6 @@ def overnight_required_from_day_plan(day_plan) -> dict[int, bool]:
         for day in day_plan.days
     }
 
-
-# ============================================================================
-# DAY ARCHETYPE OUTPUT -> TRANSIT FALLBACK
-# ============================================================================
 
 _ARCHETYPES_REQUIRING_TRANSIT_DAY = frozenset(
     {
@@ -591,35 +906,15 @@ def transit_days_from_day_plan(
     day_records: list[Mapping[str, Any]] | None = None,
 ) -> dict[int, bool]:
     """
-    Build the transit-day mapping.
+    Route-aware transit decisions are authoritative whenever day_records
+    are available.
 
-    Primary source
-    --------------
-    Route-aware day records.
-
-    Fallback source
-    --------------
-    DayArchetype classification.
-
-    When day_records are supplied, they are authoritative.
-
-    This is important because the DayArchetypeEngine currently receives
-    travel_hours as a numeric field. An unavailable route duration is
-    represented there as 0.0, so DayArchetype cannot reliably determine
-    whether an unknown route is an international transition.
-
-    Therefore:
-
-        route-aware record -> authoritative Shelf.day_kind
-
-    while DayArchetype is only a compatibility fallback.
+    DayArchetype is only a compatibility fallback when route-aware
+    records are unavailable.
     """
 
     result: dict[int, bool] = {}
 
-    # ---------------------------------------------------------------
-    # Authoritative route-aware decision.
-    # ---------------------------------------------------------------
     if day_records is not None:
         result.update(
             transit_days_from_day_records(
@@ -627,16 +922,6 @@ def transit_days_from_day_plan(
             )
         )
 
-    # ---------------------------------------------------------------
-    # Archetype fallback.
-    #
-    # IMPORTANT:
-    # If a day already exists in day_records, do NOT allow the generic
-    # archetype fallback to override the route-aware decision.
-    #
-    # Otherwise a same-country safari transfer classified as "transfer"
-    # could incorrectly become a TRANSIT Shelf.
-    # ---------------------------------------------------------------
     for day in day_plan.days:
         day_number = day.day_number
 
@@ -646,13 +931,9 @@ def transit_days_from_day_plan(
         ):
             continue
 
-        archetype_requires_transit = (
+        result[day_number] = (
             day.archetype.value
             in _ARCHETYPES_REQUIRING_TRANSIT_DAY
-        )
-
-        result[day_number] = bool(
-            archetype_requires_transit
         )
 
     return result
@@ -665,9 +946,6 @@ def transit_days_from_day_plan(
 def activity_record_from_drawer(
     drawer: Any,
 ) -> dict[str, Any]:
-    """
-    Build an activity_constraints-compatible record from a Drawer ORM row.
-    """
 
     record: dict[str, Any] = {
         "id": drawer.activity_id or drawer.id,
@@ -692,9 +970,12 @@ def activity_record_from_drawer(
         )
 
     record["_drawer_id"] = drawer.id
-
     record["_is_fallback"] = bool(
-        getattr(drawer, "is_fallback", False)
+        getattr(
+            drawer,
+            "is_fallback",
+            False,
+        )
     )
 
     return record
@@ -703,9 +984,6 @@ def activity_record_from_drawer(
 def schedule_record_from_shelf(
     shelf: Any,
 ) -> dict[str, Any]:
-    """
-    Build one ScheduleRepair-compatible day record.
-    """
 
     activities = [
         activity_record_from_drawer(drawer)
@@ -722,9 +1000,6 @@ def schedule_record_from_shelf(
 def schedule_input_from_cabinet(
     cabinet: Any,
 ) -> list[dict[str, Any]]:
-    """
-    Build the complete ScheduleRepair input from a Cabinet.
-    """
 
     return [
         schedule_record_from_shelf(shelf)
@@ -739,9 +1014,6 @@ def schedule_input_from_cabinet(
 def archetypes_by_day_number(
     day_plan,
 ) -> dict[int, Any]:
-    """
-    Build day_number -> DayArchetype mapping.
-    """
 
     return {
         day.day_number: day.archetype
@@ -752,6 +1024,11 @@ def archetypes_by_day_number(
 __all__ = [
     "minutes_to_hours",
     "hours_to_minutes",
+    "destination_min_nights",
+    "route_transition_consumes_day",
+    "route_transition_days",
+    "minimum_days_required_for_route",
+    "find_feasible_destination_order",
     "allocate_days_for_route",
     "day_record_from_route_leg",
     "day_records_from_route_analysis",
