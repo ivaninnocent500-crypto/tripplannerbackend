@@ -1,65 +1,84 @@
 """
 Route Geography Engine
-=======================
+======================
 
 Deterministic geographic truth layer for itinerary planning.
 
-Canonical specification (per audit resolution):
-
-    Doc B (SQLAlchemy/PostgreSQL integration baseline)
-        +
-    Doc A (GeoPoint / RouteStop / TransportOption / rich RouteLeg /
-            confidence / provenance / warnings / serialization)
-        +
-    NO-FABRICATION RULE (overrides both)
-
 Responsibilities
------------------
-- Resolve destinations into geographic facts (travel_places).
-- Preserve the caller's requested route order. Never reorders.
-- Build ordered route legs between consecutive stops.
-- Prefer measured database data (drive_times, flights) over any estimate.
-- Detect country changes and resolve border_crossings records.
-- Distinguish MEASURED data from DEFENSIBLE ESTIMATES from UNKNOWN.
-- Never return a fabricated distance/duration as if it were fact.
-- Provide structured, serializable facts to downstream engines
-  (day_archetype, activity_constraints, schedule_repair, itinerary
-  planning, validation) without making itinerary decisions itself.
+----------------
+- Resolve destinations from ``travel_places``.
+- Resolve coordinates from ``physical_geography`` when available.
+- Preserve the caller's requested destination order.
+- Build ordered route legs between consecutive destinations.
+- Prefer factual transport data from the real database schema.
+- Resolve scheduled flight options through destination gateways/airstrips.
+- Detect country changes.
+- Resolve border-crossing records for factual inter-country overland
+  possibilities.
+- Distinguish measured facts from coordinate-derived estimates.
+- Return ``unavailable`` when the database cannot establish a route fact.
+- Provide structured route facts to downstream engines.
 
 This engine does NOT:
-- Generate itinerary days, activities, or prose.
-- Reorder or optimize the requested route (A -> B -> C stays A -> B -> C).
-- Invent a distance/duration when no defensible data exists.
-- Create or persist Cabinet/Shelf/Drawer/Headboard/Armrest/Tray/Hinge
-  ORM records. That remains ItineraryPlanningEngine's responsibility.
+- Generate itinerary days.
+- Allocate nights.
+- Decide which destinations should be removed.
+- Decide how many transit days the itinerary receives.
+- Reorder destinations.
+- Persist Cabinet/Shelf/Drawer/Hinge records.
+- Invent road distances or road durations.
 
-Non-negotiable rule: NO FABRICATED GEOGRAPHY
-----------------------------------------------
-If the database cannot establish a defensible route, this engine
-returns:
+NO-FABRICATION RULE
+-------------------
+If no factual route duration/distance can be established:
 
     distance_km = None
     duration_minutes = None
     source = "unavailable"
     estimated = False
 
-A generic "150km / 180min" placeholder is not a geographic fact and
-must never be returned as one. A coordinate-derived great-circle
-estimate MAY be returned, but only explicitly labeled:
+Coordinate-derived estimates are allowed only when the caller explicitly
+passes:
+
+    allow_coordinate_estimate=True
+
+and are always returned as:
 
     source = "coordinate_estimate"
     estimated = True
 
-Downstream engines (starting with ItineraryPlanningEngine) are
-responsible for deciding how to present an "unavailable" duration to
-the traveler. That tolerance fix is tracked separately and is
-intentionally out of scope for this file.
+IMPORTANT SCHEMA RULE
+---------------------
+The real ``drive_times`` table represents movement within a destination
+and is not a directed destination-to-destination route table.
+
+Therefore this engine MUST NOT query:
+
+    drive_times_between_destinations
+
+or pretend that ``drive_times`` can establish:
+
+    destination A -> destination B
+
+when the schema cannot support that fact.
+
+For destination-to-destination routing, this engine uses:
+- factual flight records when available;
+- explicitly supplied coordinate estimates when enabled;
+- otherwise ``unavailable``.
 
 Route order is authoritative
-------------------------------
-The engine analyzes exactly the sequence it is given. If the caller
-wants a different order, that is a separate planning decision made
-before calling this engine, never inside it.
+----------------------------
+The input sequence is preserved exactly:
+
+    A -> B -> C
+
+is analyzed as:
+
+    A -> B
+    B -> C
+
+The engine never optimizes or reorders the route.
 """
 
 from __future__ import annotations
@@ -80,32 +99,29 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ============================================================================
 
-# A drive at or beyond this measured duration becomes a candidate for
-# comparison against a scheduled flight. This is a *comparison trigger*,
-# not a fabricated fact, so it is safe to keep as a constant.
+# Measured drive duration at which a domestic flight comparison becomes
+# worthwhile. This is a decision threshold, not a fabricated travel fact.
 DRIVE_TO_FLIGHT_COMPARISON_MINUTES = 6 * 60
 
-# Below this measured drive duration, we do not bother querying flights
-# for a domestic leg -- the drive is already short enough. International
-# legs always trigger a flight lookup regardless of this threshold.
+# Domestic routes shorter than this do not require a flight comparison
+# when a factual route duration is already known.
 MINIMUM_DOMESTIC_FLIGHT_COMPARISON_MINUTES = 3 * 60
 
+# Used only to label a factual long-transfer warning.
 LONG_TRANSFER_WARNING_MINUTES = 4 * 60
 
+# Coordinate-estimate constants.
 EARTH_RADIUS_KM = 6371.0088
-
-# Only used to label (never silently fabricate) a coordinate-derived
-# estimate when explicitly requested via allow_coordinate_estimate=True.
 ASSUMED_ROAD_SPEED_KMH = 45.0
 
 
 # ============================================================================
-# DATA CLASSES (Doc A domain model)
+# DATA CLASSES
 # ============================================================================
 
 @dataclass(frozen=True)
 class GeoPoint:
-    """Geographic coordinate. Optional -- not every row has lat/lon."""
+    """Optional geographic coordinate for a destination."""
 
     latitude: float | None = None
     longitude: float | None = None
@@ -122,7 +138,7 @@ class GeoPoint:
 
 @dataclass(frozen=True)
 class RouteStop:
-    """A resolved stop in the caller's requested route, in order."""
+    """Resolved destination in the exact caller-provided route order."""
 
     index: int
     destination_id: str
@@ -148,30 +164,31 @@ class BorderInfo:
 
 @dataclass(frozen=True)
 class TransportOption:
-    """One known, factual transport option between two stops.
+    """
+    One factual or explicitly labelled estimated transport option.
 
-    Every field that is not measured/known is explicitly None -- this
-    object never carries an invented value.
+    ``estimated=False`` means the value came from an actual database fact.
+
+    ``estimated=True`` means the value is deliberately labelled as an
+    estimate and must never be treated as measured geography.
     """
 
-    mode: str # "private_4x4" | "scheduled_flight" | "unknown"
+    mode: str
 
     distance_km: float | None
     duration_minutes: int | None
 
     source: str
-    # True only when duration/distance came from a labeled estimate
-    # (e.g. coordinate-derived), never for a flat fallback constant.
     estimated: bool
 
-    confidence: float # 0.0 - 1.0, deterministic function of source
+    confidence: float
 
     raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class RouteLeg:
-    """Deterministic geographic/transport facts for one ordered leg."""
+    """Deterministic geographic facts for one ordered route leg."""
 
     sequence: int
 
@@ -180,6 +197,7 @@ class RouteLeg:
 
     from_country: str | None
     to_country: str | None
+
     is_inter_country: bool
 
     selected: TransportOption
@@ -219,7 +237,7 @@ class RouteLeg:
 
 @dataclass
 class RouteAnalysis:
-    """Complete deterministic route analysis, in requested order."""
+    """Complete deterministic route analysis in requested order."""
 
     stops: list[RouteStop] = field(default_factory=list)
     legs: list[RouteLeg] = field(default_factory=list)
@@ -285,21 +303,34 @@ class InvalidRouteError(RouteGeographyError):
 
 class RouteGeographyEngine:
     """
-    Deterministic route geography engine.
+    Deterministic geographic truth layer.
 
-    Usage:
+    This engine supplies facts to the orchestrator and itinerary planner.
+
+    Example:
 
         engine = RouteGeographyEngine(db)
-        analysis = engine.analyze(destination_ids=["a", "b", "c"])
+
+        analysis = engine.analyze(
+            destination_ids=[
+                "tarangire-id",
+                "ngorongoro-id",
+                "serengeti-id",
+            ]
+        )
 
         for leg in analysis.legs:
-            if leg.is_unavailable:
-                # leg.duration_minutes is None -- do not invent one.
-                ...
+            print(
+                leg.from_stop.name,
+                "->",
+                leg.to_stop.name,
+                leg.duration_minutes,
+                leg.source,
+            )
     """
 
     name = "RouteGeographyEngine"
-    version = "2.0"
+    version = "3.0"
 
     def __init__(self, db: Session):
         self.db = db
@@ -315,28 +346,31 @@ class RouteGeographyEngine:
         allow_coordinate_estimate: bool = False,
     ) -> RouteAnalysis:
         """
-        Analyze an ordered destination route.
+        Analyze the caller's ordered destination sequence.
 
-        The input order is authoritative and is never reordered.
+        No destination is reordered.
+
+        No itinerary decision is made.
+
+        No route duration is fabricated.
 
         Parameters
         ----------
         destination_ids:
-            Ordered destination IDs, exactly as requested.
+            Ordered destination IDs.
+
         allow_coordinate_estimate:
-            If True, a leg with no measured drive/flight data may fall
-            back to a great-circle coordinate estimate, explicitly
-            labeled ``source="coordinate_estimate"``. If False (the
-            default), an unmeasurable leg returns
-            ``distance_km=None, duration_minutes=None,
-            source="unavailable"`` rather than any numeric guess.
+            If True, a destination pair with no measured transport fact
+            may receive a clearly labelled coordinate-derived estimate.
+
+            Default is False.
         """
 
         cleaned_ids = self._clean_destination_ids(destination_ids)
 
         if not cleaned_ids:
             return RouteAnalysis(
-                warnings=["Route contains no stops."],
+                warnings=["Route contains no stops."]
             )
 
         stops = self._resolve_stops(cleaned_ids)
@@ -350,10 +384,11 @@ class RouteGeographyEngine:
             from_stop = stops[index]
             to_stop = stops[index + 1]
 
+            # Consecutive duplicate destinations were already collapsed,
+            # but this protects the engine if the method is changed later.
             if from_stop.destination_id == to_stop.destination_id:
                 logger.info(
-                    "Skipping zero-distance leg %s -> %s (same "
-                    "destination requested consecutively).",
+                    "Skipping duplicate route leg %s -> %s.",
                     from_stop.destination_id,
                     to_stop.destination_id,
                 )
@@ -370,28 +405,36 @@ class RouteGeographyEngine:
             warnings.extend(leg.warnings)
 
         international_legs = sum(
-            1 for leg in legs if leg.is_inter_country
+            1
+            for leg in legs
+            if leg.is_inter_country
         )
 
         long_transfer_legs = sum(
-            1 for leg in legs if leg.long_transfer
+            1
+            for leg in legs
+            if leg.long_transfer
         )
 
         unavailable_legs = sum(
-            1 for leg in legs if leg.is_unavailable
+            1
+            for leg in legs
+            if leg.is_unavailable
         )
 
         unresolved_stops = [
-            stop for stop in stops if not stop.resolved
+            stop
+            for stop in stops
+            if not stop.resolved
         ]
 
         if unresolved_stops:
             warnings.append(
                 "The following destination IDs could not be resolved "
-                "in travel_places and were analyzed with no geographic "
-                "facts: "
+                "in travel_places: "
                 + ", ".join(
-                    stop.destination_id for stop in unresolved_stops
+                    stop.destination_id
+                    for stop in unresolved_stops
                 )
             )
 
@@ -413,17 +456,16 @@ class RouteGeographyEngine:
         self,
         destination_ids: list[str],
     ) -> list[RouteStop]:
-
-        by_id = self._fetch_destinations(destination_ids)
+        records = self._fetch_destinations(destination_ids)
 
         stops: list[RouteStop] = []
 
         for index, destination_id in enumerate(destination_ids):
-            record = by_id.get(destination_id)
+            record = records.get(destination_id)
 
             if record is None:
                 logger.warning(
-                    "Destination %s not found in travel_places.",
+                    "Destination %s was not found in travel_places.",
                     destination_id,
                 )
 
@@ -436,8 +478,10 @@ class RouteGeographyEngine:
                         destination_type=None,
                         point=GeoPoint(),
                         resolved=False,
+                        raw={},
                     )
                 )
+
                 continue
 
             stops.append(
@@ -463,25 +507,19 @@ class RouteGeographyEngine:
         destination_ids: list[str],
     ) -> dict[str, dict[str, Any]]:
         """
-        Load geographic metadata from travel_places, joined against
-        physical_geography for coordinates.
+        Fetch destination metadata.
 
-        FIX (real-schema alignment): travel_places itself has no
-        latitude/longitude columns in the real Supabase schema --
-        spatial data lives in the separate physical_geography table
-        (one row per destination, PostGIS geography(Point, 4326)
-        centroid column), joined here via destination_id. ST_Y/ST_X
-        extract latitude/longitude from that centroid; both are NULL
-        for a destination with no physical_geography row (a LEFT JOIN
-        is used so a missing geography row degrades to unresolved
-        coordinates rather than dropping the destination from results
-        entirely -- name/country/destination_type are still usable
-        even without a centroid).
+        ``travel_places`` supplies:
+            - id
+            - name
+            - country
+            - destination_type
 
-        Uses CAST() rather than PostgreSQL's :: syntax so the query
-        remains safe under SQLAlchemy bind-parameter processing, and
-        passes destination_ids as a native Python list -- never a
-        hand-built PostgreSQL array literal string.
+        ``physical_geography`` supplies:
+            - centroid
+
+        The LEFT JOIN intentionally preserves a destination even when
+        physical geography is missing.
         """
 
         if not destination_ids:
@@ -495,21 +533,26 @@ class RouteGeographyEngine:
                         CAST(tp.id AS text) AS destination_id,
                         tp.name,
                         CAST(tp.country AS text) AS country,
-                        CAST(tp.destination_type AS text) AS destination_type,
+                        CAST(tp.destination_type AS text)
+                            AS destination_type,
                         ST_Y(pg.centroid::geometry) AS latitude,
                         ST_X(pg.centroid::geometry) AS longitude
                     FROM travel_places tp
                     LEFT JOIN physical_geography pg
                         ON pg.destination_id = tp.id
-                    WHERE tp.id = ANY(CAST(:destination_ids AS uuid[]))
+                    WHERE tp.id = ANY(
+                        CAST(:destination_ids AS uuid[])
+                    )
                     """
                 ),
-                {"destination_ids": list(destination_ids)},
+                {
+                    "destination_ids": list(destination_ids),
+                },
             ).fetchall()
 
         except Exception:
             logger.exception(
-                "Failed to fetch destination metadata for %s",
+                "Failed to fetch destination metadata for %s.",
                 destination_ids,
             )
             raise
@@ -544,27 +587,41 @@ class RouteGeographyEngine:
         from_country = from_stop.country
         to_country = to_stop.country
 
-        is_inter_country = bool(
-            from_country
-            and to_country
-            and from_country.casefold() != to_country.casefold()
+        is_inter_country = self._countries_differ(
+            from_country,
+            to_country,
         )
 
         warnings: list[str] = []
 
-        # ------------------------------------------------------------
-        # Gather every factual option we can measure.
-        # ------------------------------------------------------------
-
         alternatives: list[TransportOption] = []
 
-        drive_option = self._find_drive_option(
+        # ------------------------------------------------------------
+        # Destination-to-destination road data
+        # ------------------------------------------------------------
+        #
+        # IMPORTANT:
+        #
+        # The real drive_times table does not represent directed
+        # travel_places -> travel_places routing.
+        #
+        # Therefore we intentionally do NOT query it here.
+        #
+        # If a future authoritative route table/API is introduced,
+        # this is the correct place to add that adapter.
+        # ------------------------------------------------------------
+
+        drive_option = self._find_destination_drive_option(
             from_stop.destination_id,
             to_stop.destination_id,
         )
 
         if drive_option is not None:
             alternatives.append(drive_option)
+
+        # ------------------------------------------------------------
+        # Flight comparison
+        # ------------------------------------------------------------
 
         should_check_flight = self._should_compare_flight(
             is_inter_country=is_inter_country,
@@ -587,14 +644,7 @@ class RouteGeographyEngine:
                 alternatives.append(flight_option)
 
         # ------------------------------------------------------------
-        # Deterministically select the best factual option.
-        #
-        # Priority: a scheduled flight found via should_check_flight
-        # is preferred whenever it exists (a real flight beats an
-        # overland guess for a long/international leg). Otherwise the
-        # measured drive is used. If neither exists, fall through to
-        # an explicit "unavailable" or, only if the caller opted in,
-        # a clearly labeled coordinate estimate.
+        # Select factual route option.
         # ------------------------------------------------------------
 
         selected: TransportOption
@@ -614,11 +664,19 @@ class RouteGeographyEngine:
 
             alternatives.append(selected)
 
-            warnings.append(
-                f"{from_stop.destination_id} -> {to_stop.destination_id}: "
-                "no measured route data was available; using a "
-                "coordinate-derived estimate explicitly labeled as such."
-            )
+            if selected.source == "coordinate_estimate":
+                warnings.append(
+                    f"{from_stop.destination_id} -> "
+                    f"{to_stop.destination_id}: no measured transport "
+                    "data was available; using an explicitly labelled "
+                    "coordinate-derived estimate."
+                )
+            else:
+                warnings.append(
+                    f"{from_stop.destination_id} -> "
+                    f"{to_stop.destination_id}: no measured transport "
+                    "data or usable coordinates are available."
+                )
 
         else:
             selected = TransportOption(
@@ -628,24 +686,34 @@ class RouteGeographyEngine:
                 source="unavailable",
                 estimated=False,
                 confidence=0.0,
+                raw={},
             )
 
             warnings.append(
-                f"{from_stop.destination_id} -> {to_stop.destination_id}: "
-                "no measured or estimated route data is available for "
-                "this leg."
+                f"{from_stop.destination_id} -> "
+                f"{to_stop.destination_id}: no measured route data "
+                "is available. Duration and distance remain unavailable."
             )
 
         # ------------------------------------------------------------
-        # Border crossing resolution (overland inter-country legs only;
-        # a scheduled flight does not require a land border record).
+        # Border-crossing information
+        # ------------------------------------------------------------
+        #
+        # A scheduled flight does not use a land-border crossing.
+        #
+        # If an overland route is selected and countries differ,
+        # resolve the factual border record.
         # ------------------------------------------------------------
 
         border: BorderInfo | None = None
         requires_border_crossing = False
 
-        if is_inter_country and selected.mode != "scheduled_flight":
+        if (
+            is_inter_country
+            and selected.mode != "scheduled_flight"
+        ):
             requires_border_crossing = True
+
             border = self._resolve_border_crossing(
                 from_country,
                 to_country,
@@ -653,37 +721,48 @@ class RouteGeographyEngine:
 
             if border is None:
                 warnings.append(
-                    f"{from_stop.destination_id} -> {to_stop.destination_id}: "
-                    "international overland leg has no resolved "
-                    "border-crossing record. Entry requirements and "
-                    "crossing status must be confirmed before booking."
+                    f"{from_stop.destination_id} -> "
+                    f"{to_stop.destination_id}: no border-crossing "
+                    "record was resolved for this international "
+                    "overland leg. Confirm route viability and entry "
+                    "requirements before booking."
                 )
+
             elif not border.available:
                 warnings.append(
-                    f"{from_stop.destination_id} -> {to_stop.destination_id}: "
-                    f"the {border.name} border crossing is currently "
-                    f"listed as '{border.status}'. This route is not "
-                    "currently viable as planned."
+                    f"{from_stop.destination_id} -> "
+                    f"{to_stop.destination_id}: the resolved border "
+                    f"crossing '{border.name}' is listed as "
+                    f"'{border.status}'."
                 )
+
+        # ------------------------------------------------------------
+        # Long-transfer flag
+        # ------------------------------------------------------------
 
         long_transfer = (
             selected.duration_minutes is not None
-            and selected.duration_minutes > LONG_TRANSFER_WARNING_MINUTES
+            and selected.duration_minutes
+            > LONG_TRANSFER_WARNING_MINUTES
         )
 
         if long_transfer:
             warnings.append(
-                f"{from_stop.destination_id} -> {to_stop.destination_id}: "
-                f"transfer of {selected.duration_minutes} minutes exceeds "
-                "the same-day comfort threshold."
+                f"{from_stop.destination_id} -> "
+                f"{to_stop.destination_id}: measured/selected "
+                f"transfer duration is "
+                f"{selected.duration_minutes} minutes."
             )
+
+        # ------------------------------------------------------------
+        # Resolution warning
+        # ------------------------------------------------------------
 
         if not from_stop.resolved or not to_stop.resolved:
             warnings.append(
-                f"{from_stop.destination_id} -> {to_stop.destination_id}: "
-                "one or both destinations could not be resolved in "
-                "travel_places; country/geography facts for this leg "
-                "may be incomplete."
+                f"{from_stop.destination_id} -> "
+                f"{to_stop.destination_id}: one or both destinations "
+                "could not be resolved in travel_places."
             )
 
         return RouteLeg(
@@ -702,91 +781,53 @@ class RouteGeographyEngine:
         )
 
     # ------------------------------------------------------------------
-    # DRIVE DATA (measured -- directed origin/destination pair)
+    # DESTINATION-TO-DESTINATION DRIVE ADAPTER
     # ------------------------------------------------------------------
 
-    def _find_drive_option(
+    def _find_destination_drive_option(
         self,
         from_destination_id: str,
         to_destination_id: str,
     ) -> TransportOption | None:
         """
-        Resolve a measured drive route for a specific, directed
-        origin -> destination pair.
+        Resolve an authoritative destination-to-destination road fact.
 
-        Deliberately queries on BOTH from_destination_id and
-        to_destination_id. A query that filters only on the
-        destination side would return the closest drive-time row to
-        the destination regardless of where the traveler is actually
-        coming from, which is not a fact about this specific leg.
+        Current schema note
+        -------------------
+        The known ``drive_times`` table is for movement within a
+        destination. It is therefore deliberately NOT queried here.
+
+        There is currently no known authoritative table in the supplied
+        schema that establishes:
+
+            travel_place A -> travel_place B
+
+        Consequently this method returns None.
+
+        This explicit adapter exists so that a future authoritative
+        destination-route source can be added without putting geography
+        logic into ItineraryPlanningEngine.
+
+        Returning None is intentional and means:
+
+            "No factual destination-to-destination road route found."
+
+        It does NOT mean:
+
+            "The route is impossible."
         """
 
-        try:
-            # FIX (real-schema alignment): queries
-            # drive_times_between_destinations, not drive_times.
-            # Supabase's real drive_times table models point-to-point
-            # drives WITHIN one destination (gate -> lodge, by free-
-            # text name); this method needs inter-destination transfer
-            # data keyed by two travel_places UUIDs, which is a
-            # different table. See missing_tables.sql.
-            row = self.db.execute(
-                text(
-                    """
-                    SELECT
-                        distance_km,
-                        duration_minutes_dry_season
-                    FROM drive_times_between_destinations
-                    WHERE from_destination_id =
-                          CAST(:from_destination_id AS uuid)
-                      AND to_destination_id =
-                          CAST(:to_destination_id AS uuid)
-                    ORDER BY
-                        duration_minutes_dry_season ASC NULLS LAST,
-                        distance_km ASC NULLS LAST
-                    LIMIT 1
-                    """
-                ),
-                {
-                    "from_destination_id": from_destination_id,
-                    "to_destination_id": to_destination_id,
-                },
-            ).fetchone()
-
-        except Exception as exc:
-            # Debug-level: some deployments may still be running an
-            # older drive_times schema without directed columns. This
-            # is not fatal -- it simply means no measured drive option
-            # is available for this leg.
-            logger.debug(
-                "Directed drive_times lookup unavailable for %s -> %s: %s",
-                from_destination_id,
-                to_destination_id,
-                exc,
-            )
-            return None
-
-        if row is None:
-            return None
-
-        distance_km = self._safe_float(row[0])
-        duration_minutes = self._safe_int(row[1])
-
-        if duration_minutes is None:
-            # A row with no usable duration is not a usable fact.
-            return None
-
-        return TransportOption(
-            mode="private_4x4",
-            distance_km=distance_km,
-            duration_minutes=duration_minutes,
-            source="drive_times_between_destinations",
-            estimated=False,
-            confidence=1.0,
-            raw={"table": "drive_times_between_destinations"},
+        logger.debug(
+            "No authoritative destination-to-destination road source "
+            "configured for %s -> %s.",
+            from_destination_id,
+            to_destination_id,
         )
 
+        return None
+
     # ------------------------------------------------------------------
-    # FLIGHT DATA (measured -- gateway airport pair)
+    # FLIGHT DATA
     # ------------------------------------------------------------------
 
     def _find_flight_option(
@@ -795,54 +836,72 @@ class RouteGeographyEngine:
         to_destination_id: str,
     ) -> TransportOption | None:
         """
-        Find the fastest measured scheduled flight connecting two
-        destinations, via either a primary gateway airport or an
-        airstrip.
+        Find the fastest factual flight connecting the two destinations.
 
-        FIX (real-schema alignment): doc 18's flights table allows
-        either an airport or an airstrip as origin/destination
-        (mutually exclusive, enforced by a CHECK constraint) -- a bush
-        flight from a remote airstrip is a normal safari transfer and
-        was previously invisible here, which only checked
-        origin_airport_id/destination_airport_id.
+        Supports:
+            - primary gateway airports
+            - destination airstrips
+
+        This follows the real flights schema where airport and airstrip
+        origin/destination are mutually exclusive.
         """
 
         try:
             row = self.db.execute(
                 text(
                     """
-                    SELECT f.duration_minutes
+                    SELECT
+                        f.duration_minutes
                     FROM flights AS f
-                    WHERE (
-                        f.origin_airport_id IN (
-                            SELECT da.airport_id
-                            FROM destination_airports AS da
-                            WHERE da.destination_id =
-                                  CAST(:from_destination_id AS uuid)
-                              AND da.is_primary_gateway = TRUE
+                    WHERE
+                        (
+                            f.origin_airport_id IN (
+                                SELECT da.airport_id
+                                FROM destination_airports da
+                                WHERE da.destination_id =
+                                      CAST(
+                                          :from_destination_id
+                                          AS uuid
+                                      )
+                                  AND da.is_primary_gateway = TRUE
+                            )
+                            OR
+                            f.origin_airstrip_id IN (
+                                SELECT a.id
+                                FROM airstrips a
+                                WHERE a.destination_id =
+                                      CAST(
+                                          :from_destination_id
+                                          AS uuid
+                                      )
+                            )
                         )
-                        OR f.origin_airstrip_id IN (
-                            SELECT id FROM airstrips
-                            WHERE destination_id =
-                                  CAST(:from_destination_id AS uuid)
+                        AND
+                        (
+                            f.destination_airport_id IN (
+                                SELECT da.airport_id
+                                FROM destination_airports da
+                                WHERE da.destination_id =
+                                      CAST(
+                                          :to_destination_id
+                                          AS uuid
+                                      )
+                                  AND da.is_primary_gateway = TRUE
+                            )
+                            OR
+                            f.destination_airstrip_id IN (
+                                SELECT a.id
+                                FROM airstrips a
+                                WHERE a.destination_id =
+                                      CAST(
+                                          :to_destination_id
+                                          AS uuid
+                                      )
+                            )
                         )
-                    )
-                    AND (
-                        f.destination_airport_id IN (
-                            SELECT da.airport_id
-                            FROM destination_airports AS da
-                            WHERE da.destination_id =
-                                  CAST(:to_destination_id AS uuid)
-                              AND da.is_primary_gateway = TRUE
-                        )
-                        OR f.destination_airstrip_id IN (
-                            SELECT id FROM airstrips
-                            WHERE destination_id =
-                                  CAST(:to_destination_id AS uuid)
-                        )
-                    )
-                    AND f.duration_minutes IS NOT NULL
-                    ORDER BY f.duration_minutes ASC
+                        AND f.duration_minutes IS NOT NULL
+                    ORDER BY
+                        f.duration_minutes ASC
                     LIMIT 1
                     """
                 ),
@@ -876,11 +935,13 @@ class RouteGeographyEngine:
             source="flights_table",
             estimated=False,
             confidence=1.0,
-            raw={"table": "flights"},
+            raw={
+                "table": "flights",
+            },
         )
 
     # ------------------------------------------------------------------
-    # COORDINATE ESTIMATE (opt-in only, always explicitly labeled)
+    # COORDINATE ESTIMATE
     # ------------------------------------------------------------------
 
     def _coordinate_estimate(
@@ -891,12 +952,13 @@ class RouteGeographyEngine:
         is_inter_country: bool,
     ) -> TransportOption:
         """
-        A great-circle distance/duration estimate, used ONLY when the
-        caller explicitly opts in via allow_coordinate_estimate=True
-        and no measured data exists. Always labeled source =
-        "coordinate_estimate" and estimated=True -- this must never be
-        confused with a measured database fact by any downstream
-        consumer.
+        Produce an explicitly labelled coordinate-derived estimate.
+
+        This is NEVER returned unless the caller explicitly enables:
+
+            allow_coordinate_estimate=True
+
+        The value is not a measured road duration.
         """
 
         distance_km = self._haversine_km(
@@ -905,7 +967,6 @@ class RouteGeographyEngine:
         )
 
         if distance_km is None:
-            # Not even coordinates are available. Stay honest.
             return TransportOption(
                 mode="unknown",
                 distance_km=None,
@@ -913,38 +974,56 @@ class RouteGeographyEngine:
                 source="unavailable",
                 estimated=False,
                 confidence=0.0,
+                raw={},
             )
 
         duration_minutes = int(
-            round((distance_km / ASSUMED_ROAD_SPEED_KMH) * 60)
+            round(
+                (distance_km / ASSUMED_ROAD_SPEED_KMH)
+                * 60
+            )
         )
 
         return TransportOption(
-            mode="private_4x4" if not is_inter_country else "unknown",
+            mode=(
+                "private_4x4"
+                if not is_inter_country
+                else "unknown"
+            ),
             distance_km=round(distance_km, 2),
             duration_minutes=duration_minutes,
             source="coordinate_estimate",
             estimated=True,
-            # Coordinate estimates are inherently low-confidence: no
-            # road network, terrain, or border-crossing time is
-            # reflected in a straight-line calculation.
             confidence=0.25,
             raw={
                 "method": "haversine",
                 "assumed_speed_kmh": ASSUMED_ROAD_SPEED_KMH,
+                "warning": (
+                    "Not a measured road-network route. "
+                    "Does not account for roads, terrain, gates, "
+                    "border processing, traffic, or actual routing."
+                ),
             },
         )
 
     @staticmethod
-    def _haversine_km(a: GeoPoint, b: GeoPoint) -> float | None:
+    def _haversine_km(
+        a: GeoPoint,
+        b: GeoPoint,
+    ) -> float | None:
         if not a.available or not b.available:
             return None
 
         lat1 = math.radians(a.latitude)
         lat2 = math.radians(b.latitude)
 
-        delta_lat = math.radians(b.latitude - a.latitude)
-        delta_lon = math.radians(b.longitude - a.longitude)
+        delta_lat = math.radians(
+            b.latitude - a.latitude
+        )
+
+        delta_lon = math.radians(
+            b.longitude - a.longitude
+        )
 
         haversine = (
             math.sin(delta_lat / 2) ** 2
@@ -953,14 +1032,21 @@ class RouteGeographyEngine:
             * math.sin(delta_lon / 2) ** 2
         )
 
+        haversine = max(
+            0.0,
+            min(1.0, haversine),
+        )
+
         return (
             2
             * EARTH_RADIUS_KM
-            * math.asin(math.sqrt(max(0.0, min(1.0, haversine))))
+            * math.asin(
+                math.sqrt(haversine)
+            )
         )
 
     # ------------------------------------------------------------------
-    # FLIGHT-COMPARISON DECISION
+    # FLIGHT COMPARISON
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -969,15 +1055,14 @@ class RouteGeographyEngine:
         drive_duration_minutes: int | None,
     ) -> bool:
         """
-        Decide whether a flight lookup is worth performing.
+        Determine whether a flight lookup should be attempted.
 
-        International legs are always checked -- a real scheduled
-        flight is preferable to assuming an overland route exists.
+        International:
+            always check.
 
-        Domestic legs are checked only when either no drive data
-        exists at all (so a flight might be the only measurable
-        option) or the measured drive is long enough that a flight
-        is a realistic alternative.
+        Domestic:
+            check if no factual drive duration exists or if the drive
+            is sufficiently long to make air transport relevant.
         """
 
         if is_inter_country:
@@ -1014,18 +1099,22 @@ class RouteGeographyEngine:
                         CAST(status AS text),
                         visa_notes
                     FROM border_crossings
-                    WHERE (
-                        country_a::text = :country_a
-                        AND country_b::text = :country_b
-                    )
-                    OR (
-                        country_a::text = :country_b
-                        AND country_b::text = :country_a
-                    )
+                    WHERE
+                        (
+                            country_a::text = :country_a
+                            AND country_b::text = :country_b
+                        )
+                        OR
+                        (
+                            country_a::text = :country_b
+                            AND country_b::text = :country_a
+                        )
                     ORDER BY
                         CASE
-                            WHEN CAST(status AS text) = 'open' THEN 0
-                            WHEN CAST(status AS text) IS NULL THEN 1
+                            WHEN CAST(status AS text) = 'open'
+                                THEN 0
+                            WHEN CAST(status AS text) IS NULL
+                                THEN 1
                             ELSE 2
                         END,
                         (visa_notes IS NOT NULL) DESC,
@@ -1039,29 +1128,42 @@ class RouteGeographyEngine:
                 },
             ).fetchone()
 
-        except Exception:
-            logger.exception(
-                "Failed to resolve border crossing %s -> %s",
+        except Exception as exc:
+            logger.debug(
+                "Border crossing lookup unavailable for %s -> %s: %s",
                 from_country,
                 to_country,
+                exc,
             )
             return None
 
         if row is None:
             return None
 
-        border_crossing_id, name, status, visa_notes = row
+        (
+            border_crossing_id,
+            name,
+            status,
+            visa_notes,
+        ) = row
 
         status = self._normalise_text(status)
 
         return BorderInfo(
             border_crossing_id=(
-                str(border_crossing_id) if border_crossing_id else None
+                str(border_crossing_id)
+                if border_crossing_id
+                else None
             ),
-            name=name,
+            name=self._normalise_text(name),
             status=status,
             visa_notes=visa_notes,
-            available=status not in ("closed", "restricted"),
+            available=(
+                status not in {
+                    "closed",
+                    "restricted",
+                }
+            ),
             source="border_crossings",
         )
 
@@ -1074,14 +1176,23 @@ class RouteGeographyEngine:
         destination_ids: Sequence[str],
     ) -> list[str]:
         """
-        Normalize to strings, drop empties, collapse consecutive
-        duplicates -- while preserving the caller's requested order.
-        This never reorders; it only removes exact adjacent repeats
-        (e.g. the same destination requested twice in a row).
+        Normalize IDs without changing route order.
+
+        Removes:
+            - None
+            - empty strings
+            - consecutive duplicate IDs
+
+        Does NOT:
+            - sort
+            - optimize
+            - remove non-consecutive destinations
         """
 
         if destination_ids is None:
-            raise InvalidRouteError("destination_ids cannot be None.")
+            raise InvalidRouteError(
+                "destination_ids cannot be None."
+            )
 
         result: list[str] = []
 
@@ -1094,12 +1205,28 @@ class RouteGeographyEngine:
             if not destination_id:
                 continue
 
-            if result and result[-1] == destination_id:
+            if (
+                result
+                and result[-1] == destination_id
+            ):
                 continue
 
             result.append(destination_id)
 
         return result
+
+    @staticmethod
+    def _countries_differ(
+        from_country: str | None,
+        to_country: str | None,
+    ) -> bool:
+        if not from_country or not to_country:
+            return False
+
+        return (
+            from_country.casefold()
+            != to_country.casefold()
+        )
 
     @staticmethod
     def _ordered_countries(
@@ -1123,7 +1250,9 @@ class RouteGeographyEngine:
         return result
 
     @staticmethod
-    def _normalise_text(value: Any) -> str | None:
+    def _normalise_text(
+        value: Any,
+    ) -> str | None:
         if value is None:
             return None
 
@@ -1132,25 +1261,38 @@ class RouteGeographyEngine:
         return value or None
 
     @staticmethod
-    def _safe_float(value: Any) -> float | None:
+    def _safe_float(
+        value: Any,
+    ) -> float | None:
         if value is None:
             return None
 
         try:
             result = float(value)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return None
 
-        return result if math.isfinite(result) else None
+        if not math.isfinite(result):
+            return None
+
+        return result
 
     @staticmethod
-    def _safe_int(value: Any) -> int | None:
+    def _safe_int(
+        value: Any,
+    ) -> int | None:
         if value is None:
             return None
 
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return None
 
 
@@ -1158,7 +1300,9 @@ class RouteGeographyEngine:
 # SERIALIZATION
 # ============================================================================
 
-def _transport_option_to_dict(option: TransportOption) -> dict[str, Any]:
+def _transport_option_to_dict(
+    option: TransportOption,
+) -> dict[str, Any]:
     return {
         "mode": option.mode,
         "distance_km": option.distance_km,
@@ -1169,7 +1313,9 @@ def _transport_option_to_dict(option: TransportOption) -> dict[str, Any]:
     }
 
 
-def _border_info_to_dict(border: BorderInfo | None) -> dict[str, Any] | None:
+def _border_info_to_dict(
+    border: BorderInfo | None,
+) -> dict[str, Any] | None:
     if border is None:
         return None
 
@@ -1183,7 +1329,9 @@ def _border_info_to_dict(border: BorderInfo | None) -> dict[str, Any] | None:
     }
 
 
-def _stop_to_dict(stop: RouteStop) -> dict[str, Any]:
+def _stop_to_dict(
+    stop: RouteStop,
+) -> dict[str, Any]:
     return {
         "index": stop.index,
         "destination_id": stop.destination_id,
@@ -1196,11 +1344,17 @@ def _stop_to_dict(stop: RouteStop) -> dict[str, Any]:
     }
 
 
-def _leg_to_dict(leg: RouteLeg) -> dict[str, Any]:
+def _leg_to_dict(
+    leg: RouteLeg,
+) -> dict[str, Any]:
     return {
         "sequence": leg.sequence,
-        "from_destination_id": leg.from_stop.destination_id,
-        "to_destination_id": leg.to_stop.destination_id,
+        "from_destination_id": (
+            leg.from_stop.destination_id
+        ),
+        "to_destination_id": (
+            leg.to_stop.destination_id
+        ),
         "from_country": leg.from_country,
         "to_country": leg.to_country,
         "is_inter_country": leg.is_inter_country,
@@ -1215,42 +1369,72 @@ def _leg_to_dict(leg: RouteLeg) -> dict[str, Any]:
             _transport_option_to_dict(option)
             for option in leg.alternatives
         ],
-        "requires_border_crossing": leg.requires_border_crossing,
-        "border_crossing": _border_info_to_dict(leg.border_crossing),
+        "requires_border_crossing": (
+            leg.requires_border_crossing
+        ),
+        "border_crossing": _border_info_to_dict(
+            leg.border_crossing
+        ),
         "long_transfer": leg.long_transfer,
         "warnings": list(leg.warnings),
     }
 
 
-def route_analysis_to_dict(analysis: RouteAnalysis) -> dict[str, Any]:
+def route_analysis_to_dict(
+    analysis: RouteAnalysis,
+) -> dict[str, Any]:
     """
-    Convert a RouteAnalysis into JSON-safe primitives, suitable for
-    generation logs, API responses, or debugging.
+    Convert RouteAnalysis into JSON-safe primitives.
+
+    Suitable for:
+        - generation logs
+        - API responses
+        - debugging
+        - downstream engine adapters
     """
 
     return {
         "engine": RouteGeographyEngine.name,
         "version": RouteGeographyEngine.version,
-        "stops": [_stop_to_dict(stop) for stop in analysis.stops],
-        "legs": [_leg_to_dict(leg) for leg in analysis.legs],
+        "stops": [
+            _stop_to_dict(stop)
+            for stop in analysis.stops
+        ],
+        "legs": [
+            _leg_to_dict(leg)
+            for leg in analysis.legs
+        ],
         "summary": {
             "stop_count": analysis.stop_count,
             "leg_count": analysis.leg_count,
             "countries": list(analysis.countries),
-            "international_legs": analysis.international_legs,
-            "long_transfer_legs": analysis.long_transfer_legs,
-            "unavailable_legs": analysis.unavailable_legs,
-            "has_cross_border_travel": analysis.has_cross_border_travel,
-            "has_unavailable_data": analysis.has_unavailable_data,
+            "international_legs": (
+                analysis.international_legs
+            ),
+            "long_transfer_legs": (
+                analysis.long_transfer_legs
+            ),
+            "unavailable_legs": (
+                analysis.unavailable_legs
+            ),
+            "has_cross_border_travel": (
+                analysis.has_cross_border_travel
+            ),
+            "has_unavailable_data": (
+                analysis.has_unavailable_data
+            ),
             "total_known_distance_km": round(
-                analysis.total_known_distance_km, 2
+                analysis.total_known_distance_km,
+                2,
             ),
             "total_known_duration_minutes": (
                 analysis.total_known_duration_minutes
             ),
         },
         "warnings": list(analysis.warnings),
-        "generated_at": analysis.generated_at.isoformat(),
+        "generated_at": (
+            analysis.generated_at.isoformat()
+        ),
     }
 
 
@@ -1265,8 +1449,7 @@ def analyze_route(
     allow_coordinate_estimate: bool = False,
 ) -> RouteAnalysis:
     """
-    Functional wrapper for callers that do not need to retain the
-    engine instance.
+    Convenience wrapper around RouteGeographyEngine.
     """
 
     return RouteGeographyEngine(db).analyze(
@@ -1274,6 +1457,10 @@ def analyze_route(
         allow_coordinate_estimate=allow_coordinate_estimate,
     )
 
+
+# ============================================================================
+# PUBLIC EXPORTS
+# ============================================================================
 
 __all__ = [
     "GeoPoint",
@@ -1288,4 +1475,3 @@ __all__ = [
     "route_analysis_to_dict",
     "analyze_route",
 ]
-
