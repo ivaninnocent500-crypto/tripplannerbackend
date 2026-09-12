@@ -7,48 +7,34 @@ DB-free planning engines.
 
 Important architecture rule
 ----------------------------
-A route transition and a route duration are two different facts.
+A route transition and a transit-day decision are two different facts.
 
-For example:
+A destination can change without consuming the calendar day as a
+dedicated TRANSIT day.
+
+Examples:
+
+    Serengeti -> Ngorongoro
+        same country
+        normal safari routing
+        duration may be known or unknown
+        -> NOT automatically TRANSIT
 
     Ngorongoro -> Pyramids
-        transition exists = TRUE
-        crosses country = TRUE
-        duration = UNKNOWN
+        different country
+        international transition
+        duration may be unknown
+        -> TRANSIT
 
-The adapter must NOT convert UNKNOWN into a fabricated duration.
+    Same-country route taking 7 hours
+        measured long travel
+        -> TRANSIT
 
-Instead it carries both facts independently:
-
-    is_destination_transition = True
-    route_duration_available = False
-    travel_hours = 0.0 # only because the downstream
-                                      # DayArchetype contract is numeric
+The adapter must NOT fabricate a duration when the route duration
+is unavailable.
 
 The raw RouteLeg remains attached so downstream code can distinguish
-"zero travel" from "unknown travel".
-
-Transit-day semantics
-----------------------
-A calendar day is a TRANSIT day when the itinerary actually enters a
-different destination as part of the route.
-
-This is independent of whether the route duration is known.
-
-Therefore:
-
-    measured 6h30m inter-destination route
-        -> TRANSIT
-
-    measured 2h inter-destination route
-        -> TRANSIT
-
-    unavailable inter-destination route
-        -> TRANSIT
-
-The DayArchetypeEngine may additionally classify the day as
-LONG_TRANSFER / TRANSFER based on known duration, but the persistence
-layer's Shelf.day_kind decision must not depend on duration being known.
+known travel from unknown travel.
 
 No ORM records are created here.
 """
@@ -64,6 +50,15 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# TRANSIT RULES
+# ============================================================================
+
+# A measured route consuming approximately half a day or more is treated
+# as a dedicated transit day.
+TRANSIT_TRAVEL_THRESHOLD_HOURS = 6.0
+
+
+# ============================================================================
 # UNIT CONVERSION
 # ============================================================================
 
@@ -74,10 +69,11 @@ def minutes_to_hours(minutes: int | None) -> float:
     None remains semantically unavailable.
 
     The downstream DayArchetype contract currently expects a numeric
-    travel_hours field, so None is represented as 0.0 there. The adapter
-    ALWAYS carries the original RouteLeg and an explicit
-    route_duration_available flag alongside it so 0.0 is never treated
-    as evidence that the route actually takes zero hours.
+    travel_hours field, so None is represented as 0.0 there.
+
+    The original RouteLeg and route_duration_available flag are preserved
+    so 0.0 is never interpreted as evidence that the route actually takes
+    zero hours.
     """
     if minutes is None:
         return 0.0
@@ -240,19 +236,39 @@ def day_record_from_route_leg(
     """
     Build one DayArchetype-compatible record.
 
-    Critical distinction
-    --------------------
-    `is_destination_transition` means:
+    IMPORTANT
+    ---------
+    A destination transition does NOT automatically mean the calendar
+    day is a TRANSIT day.
 
-        "A route leg actually moves the traveler from one requested
-         destination to another."
+    The route facts are kept separately:
 
-    It does NOT mean:
+        is_destination_transition
+        route_duration_available
+        travel_hours
+        crosses_country
+        requires_transit_day
 
-        "We know how long that movement takes."
+    Transit-day semantics:
 
-    Therefore an unavailable RouteLeg is still a valid transition and
-    must still be capable of producing a TRANSIT Shelf.
+        1. Cross-country/international transition
+           -> TRANSIT
+
+        2. Measured travel >= 6 hours
+           -> TRANSIT
+
+        3. Same-country destination transition below 6 hours
+           -> NOT automatically TRANSIT
+
+        4. Unknown-duration same-country transition
+           -> NOT automatically TRANSIT
+
+    This prevents normal safari routing such as:
+
+        Serengeti -> Ngorongoro
+
+    from becoming a dedicated travel day merely because the destination
+    changed.
     """
 
     record: dict[str, Any] = {
@@ -262,7 +278,6 @@ def day_record_from_route_leg(
         "destination_type": destination_type,
         "activity_count": activity_count,
 
-        # Explicit semantic flags used by the pipeline adapter.
         "is_destination_transition": False,
         "route_duration_available": False,
         "route_unavailable": False,
@@ -274,37 +289,80 @@ def day_record_from_route_leg(
             leg.duration_minutes is not None
         )
 
-        is_destination_transition = True
+        travel_hours = minutes_to_hours(
+            leg.duration_minutes
+        )
+
+        crosses_country = bool(
+            leg.is_inter_country
+        )
+
+        # ---------------------------------------------------------------
+        # Transit decision
+        # ---------------------------------------------------------------
+        #
+        # DO NOT use:
+        #
+        # is_destination_transition = True
+        #
+        # as the transit criterion.
+        #
+        # A destination change is only a route fact.
+        #
+        # A TRANSIT day requires either:
+        #
+        # - an international/cross-country transition, OR
+        # - measured travel that consumes >= 6 hours.
+        #
+        # Therefore:
+        #
+        # Serengeti -> Ngorongoro
+        # crosses_country = False
+        # travel < 6h OR unavailable
+        # -> STANDARD
+        #
+        # Ngorongoro -> Pyramids
+        # crosses_country = True
+        # -> TRANSIT
+        #
+        requires_transit_day = (
+            crosses_country
+            or (
+                duration_available
+                and travel_hours >= TRANSIT_TRAVEL_THRESHOLD_HOURS
+            )
+        )
 
         record.update(
             {
                 "transfer": True,
-                "travel_hours": minutes_to_hours(
-                    leg.duration_minutes
-                ),
+
+                "travel_hours": travel_hours,
+
                 "travel_distance_km": (
                     leg.distance_km
                     if leg.distance_km is not None
                     else 0.0
                 ),
-                "crosses_country": bool(
-                    leg.is_inter_country
-                ),
+
+                "crosses_country": crosses_country,
+
                 "border_crossing": bool(
                     leg.requires_border_crossing
                 ),
 
-                # These are intentionally independent of duration.
-                "is_destination_transition": is_destination_transition,
+                # A route transition exists independently from whether
+                # it consumes the day as TRANSIT.
+                "is_destination_transition": True,
+
                 "route_duration_available": duration_available,
+
                 "route_unavailable": not duration_available,
 
-                # A destination-to-destination route transition consumes
-                # the arrival/transfer day regardless of whether the
-                # duration is known.
-                "requires_transit_day": True,
+                # This is the actual Shelf.day_kind decision.
+                "requires_transit_day": requires_transit_day,
 
-                # Preserve the authoritative source object.
+                # Preserve authoritative route information.
                 "_route_leg": leg,
             }
         )
@@ -322,10 +380,14 @@ def day_record_from_route_leg(
             "travel_distance_km": 0.0,
             "crosses_country": False,
             "border_crossing": False,
+
             "is_destination_transition": False,
+
             "route_duration_available": False,
             "route_unavailable": False,
+
             "requires_transit_day": False,
+
             "_route_leg": None,
         }
     )
@@ -351,16 +413,14 @@ def day_records_from_route_analysis(
     The route leg between destination A and destination B is attached
     to the FIRST calendar day allocated to destination B.
 
-    That day is explicitly marked:
+    Important:
 
-        is_destination_transition = True
-        requires_transit_day = True
+        A route leg means a destination transition exists.
 
-    even when:
+        It does NOT automatically mean that day is TRANSIT.
 
-        leg.duration_minutes is None
-
-    This is the critical fix for unavailable inter-destination routes.
+    The final transit decision is made by day_record_from_route_leg()
+    using cross-country status and measured travel duration.
     """
 
     if len(destination_order) != len(nights_per_destination):
@@ -431,8 +491,7 @@ def day_records_from_route_analysis(
 
             records.append(record)
 
-    # Defensive invariant:
-    # the number of generated records must match the requested trip days.
+    # Defensive invariant.
     if len(records) != total_days:
         raise ValueError(
             "Generated day records do not match total_days: "
@@ -450,25 +509,30 @@ def transit_days_from_day_records(
     day_records: list[Mapping[str, Any]],
 ) -> dict[int, bool]:
     """
-    Extract the authoritative transit-day decision directly from the
-    route-aware day records.
+    Extract the authoritative transit-day decision from route-aware
+    day records.
 
-    This is intentionally NOT based on DayArchetype.
-
-    Why?
+    This is intentionally independent of DayArchetype.
 
     DayArchetype answers:
 
         "What kind of day is this?"
 
-    Transit-day persistence answers:
+    Transit persistence answers:
 
-        "Does this day contain a destination-to-destination transition?"
+        "Should this Shelf be persisted as TRANSIT?"
 
-    Those are related but not identical questions.
+    The route-aware decision is:
 
-    Most importantly, an unavailable route duration must not prevent a
-    real destination transition from becoming a TRANSIT Shelf.
+        cross-country -> TRANSIT
+
+        OR
+
+        measured travel >= 6h -> TRANSIT
+
+        otherwise -> STANDARD
+
+    A destination transition alone is NOT enough.
     """
 
     transit_days: dict[int, bool] = {}
@@ -537,26 +601,18 @@ def transit_days_from_day_plan(
     --------------
     DayArchetype classification.
 
-    The route-aware source is authoritative because a route can be
-    unavailable while still being a genuine destination transition.
+    When day_records are supplied, they are authoritative.
 
-    Example:
-
-        Ngorongoro -> Pyramids
-        duration = None
-
-    DayArchetype may classify this as SAFARI because it cannot infer
-    travel hours from None.
-
-    That must NOT erase the route transition.
+    This is important because the DayArchetypeEngine currently receives
+    travel_hours as a numeric field. An unavailable route duration is
+    represented there as 0.0, so DayArchetype cannot reliably determine
+    whether an unknown route is an international transition.
 
     Therefore:
 
-        route record says TRANSIT -> True
-        archetype says SAFARI -> irrelevant
+        route-aware record -> authoritative Shelf.day_kind
 
-    The fallback to archetype exists only for compatibility with
-    callers that do not provide day_records.
+    while DayArchetype is only a compatibility fallback.
     """
 
     result: dict[int, bool] = {}
@@ -572,20 +628,31 @@ def transit_days_from_day_plan(
         )
 
     # ---------------------------------------------------------------
-    # Archetype fallback / compatibility.
+    # Archetype fallback.
+    #
+    # IMPORTANT:
+    # If a day already exists in day_records, do NOT allow the generic
+    # archetype fallback to override the route-aware decision.
+    #
+    # Otherwise a same-country safari transfer classified as "transfer"
+    # could incorrectly become a TRANSIT Shelf.
     # ---------------------------------------------------------------
     for day in day_plan.days:
         day_number = day.day_number
+
+        if (
+            day_records is not None
+            and day_number in result
+        ):
+            continue
 
         archetype_requires_transit = (
             day.archetype.value
             in _ARCHETYPES_REQUIRING_TRANSIT_DAY
         )
 
-        # Never downgrade an explicit route transition.
         result[day_number] = bool(
-            result.get(day_number, False)
-            or archetype_requires_transit
+            archetype_requires_transit
         )
 
     return result
@@ -625,6 +692,7 @@ def activity_record_from_drawer(
         )
 
     record["_drawer_id"] = drawer.id
+
     record["_is_fallback"] = bool(
         getattr(drawer, "is_fallback", False)
     )
