@@ -1,78 +1,56 @@
 """
 Pipeline Adapters
-==================
+=================
 
-Translation layer between the persistence-facing engines
-(RouteGeographyEngine, ItineraryPlanningEngine, ValidationEngine -- all
-of which operate on SQLAlchemy Sessions and ORM rows / typed
-dataclasses in minutes) and the four pure, DB-free planning engines
-(day_archetype.py, activity_constraints.py, schedule_repair.py -- all
-of which operate on plain Mapping[str, Any] records in HOURS).
+Translation layer between persistence-facing engines and the pure,
+DB-free planning engines.
 
-This file exists because those two groups of engines were designed
-independently and do not share a data contract:
+Important architecture rule
+----------------------------
+A route transition and a route duration are two different facts.
 
-    route_geography.RouteLeg.duration_minutes -> int | None, MINUTES
-    day_archetype.DaySignals.travel_hours -> float, HOURS
+For example:
 
-    ItineraryPlanningEngine's Cabinet/Shelf/Drawer ORM rows
-        -> day_archetype.py / activity_constraints.py /
-           schedule_repair.py's Mapping[str, Any] record shape
+    Ngorongoro -> Pyramids
+        transition exists = TRUE
+        crosses country = TRUE
+        duration = UNKNOWN
 
-Nothing here invents data. Every adapter function either:
-  (a) carries a value through with a unit conversion, or
-  (b) passes through Nones/absences as absences (never a fabricated
-      default that could be mistaken for a real fact), or
-  (c) attaches a domain object (DayArchetypeResult, RouteLeg) as
-      context that a downstream engine can consult explicitly.
+The adapter must NOT convert UNKNOWN into a fabricated duration.
 
-This module does NOT create or persist ORM records
-(Cabinet/Shelf/Drawer/Headboard/Armrest/Tray/Hinge). It only reads
-existing ORM state and RouteAnalysis output, and produces plain
-dict/dataclass values for the four planning engines to consume. That
-responsibility boundary matches the audit-locked architecture: the new
-engines return domain results, they do not touch persistence.
+Instead it carries both facts independently:
 
-CHANGE LOG (this rewrite -- transit-day fix, backend stage 1)
---------------------------------------------------------------------
-PROBLEM BEING FIXED: DayArchetypeEngine (which classifies a day as
-LONG_TRANSFER when travel_hours crosses day_archetype.py's own
-LONG_TRAVEL_HOURS/VERY_LONG_TRAVEL_HOURS thresholds) previously ran
-AFTER ItineraryPlanningEngine.build() had already constructed every
-Drawer for every day -- including forcing a normal activity template
-(arrival transfer + lunch + an activity + sundowner) onto a day that
-was, in reality, consumed by an intercontinental flight (e.g.
-Tanzania -> Ethiopia, Tanzania -> Madagascar). The archetype
-classification existed but was computed too late to influence what got
-built; it was only ever used afterward, for ValidationEngine's
-warnings.
+    is_destination_transition = True
+    route_duration_available = False
+    travel_hours = 0.0 # only because the downstream
+                                      # DayArchetype contract is numeric
 
-ROOT CAUSE: day_records_from_route_analysis() (used to build
-DayArchetypeEngine's input) requires nights_per_destination, which was
-only known AFTER ItineraryPlanningEngine._allocate_days() ran --
-creating a real circular dependency (planning needs archetypes to
-avoid the transit-day bug; archetypes need day allocation; day
-allocation used to live inside planning).
+The raw RouteLeg remains attached so downstream code can distinguish
+"zero travel" from "unknown travel".
 
-FIX: day-allocation logic is extracted out of ItineraryPlanningEngine
-entirely and into allocate_days_for_route() below -- a pure function
-with no DB access and no side effects, taking exactly the inputs
-ItineraryPlanningEngine._allocate_days() used to close over
-(destination_ids, per-destination meta, total_days, travel_style).
-This breaks the circular dependency: the orchestrator can now call
-allocate_days_for_route() first, feed its result into
-day_records_from_route_analysis() to get DayArchetypeEngine's
-classification, and THEN call ItineraryPlanningEngine.build() with
-that classification already available -- see itinerary_v2.py's
-reordered generate() method.
+Transit-day semantics
+----------------------
+A calendar day is a TRANSIT day when the itinerary actually enters a
+different destination as part of the route.
 
-ItineraryPlanningEngine.build() no longer performs its own day
-allocation; it accepts the already-computed allocation as a parameter.
-This is a deliberate responsibility move (planning engine no longer
-owns "how many nights per destination"), not a duplication -- the old
-_allocate_days() method's logic is preserved VERBATIM below, just
-relocated and stripped of its `self` dependency (it never used `self`
-for anything except being a method in the first place).
+This is independent of whether the route duration is known.
+
+Therefore:
+
+    measured 6h30m inter-destination route
+        -> TRANSIT
+
+    measured 2h inter-destination route
+        -> TRANSIT
+
+    unavailable inter-destination route
+        -> TRANSIT
+
+The DayArchetypeEngine may additionally classify the day as
+LONG_TRANSFER / TRANSFER based on known duration, but the persistence
+layer's Shelf.day_kind decision must not depend on duration being known.
+
+No ORM records are created here.
 """
 
 from __future__ import annotations
@@ -91,19 +69,16 @@ logger = logging.getLogger(__name__)
 
 def minutes_to_hours(minutes: int | None) -> float:
     """
-    Convert minutes to hours for the hour-based engines.
+    Convert a known duration from minutes to hours.
 
-    A None (unavailable) duration converts to 0.0 hours rather than
-    being silently dropped -- callers that need to distinguish "no
-    travel" from "unknown travel duration" should check the
-    originating RouteLeg.is_unavailable flag directly, which this
-    module always makes available alongside the numeric value (see
-    day_record_for_leg below). Converting None -> 0.0 only at this
-    single, narrow boundary (rather than upstream) keeps the
-    "unavailable" fact itself intact for anything that inspects the
-    RouteLeg/Hinge directly.
+    None remains semantically unavailable.
+
+    The downstream DayArchetype contract currently expects a numeric
+    travel_hours field, so None is represented as 0.0 there. The adapter
+    ALWAYS carries the original RouteLeg and an explicit
+    route_duration_available flag alongside it so 0.0 is never treated
+    as evidence that the route actually takes zero hours.
     """
-
     if minutes is None:
         return 0.0
 
@@ -118,14 +93,9 @@ def hours_to_minutes(hours: float | None) -> int | None:
 
 
 # ============================================================================
-# DAY ALLOCATION (extracted from ItineraryPlanningEngine -- see module
-# docstring for why)
+# DAY ALLOCATION
 # ============================================================================
 
-# Preserved verbatim from ItineraryPlanningEngine's own module-level
-# constant. Kept here (not re-imported from itineraryPlanningEngine.py)
-# to avoid a reverse import (that module now imports FROM this one, for
-# allocate_days_for_route -- importing back would create a cycle).
 BORDER_BUFFER_NIGHTS = 1
 
 
@@ -137,33 +107,23 @@ def allocate_days_for_route(
     travel_style: list[str],
 ) -> tuple[list[int], list[str]]:
     """
-    Decide how many nights each destination in the route receives,
-    given the trip's total day count.
+    Decide how many nights each destination receives.
 
-    This is the exact logic that previously lived as
-    ItineraryPlanningEngine._allocate_days() -- moved here unchanged
-    (aside from dropping `self`, which the original method never
-    actually used) so it can run BEFORE ItineraryPlanningEngine.build(),
-    breaking the circular dependency described in this module's
-    docstring. `meta` is the same per-destination metadata dict
-    ItineraryPlanningEngine._fetch_destination_meta() already produces
-    (country, headline_label, destination_type, min_nights) --
-    callers should fetch that first and pass it in unchanged.
-
-    `travel_style` is accepted for signature compatibility with the
-    original method (and in case a future revision wants to factor it
-    into allocation) but is not currently read by the allocation logic
-    itself -- same as before this extraction.
+    This is the extracted allocation logic formerly owned by
+    ItineraryPlanningEngine._allocate_days().
     """
 
     n = len(destination_ids)
+
     if n == 0:
         return [], []
 
     if total_days < n:
         allocation = [0] * n
+
         for index in range(total_days):
             allocation[index] = 1
+
         return allocation, [
             "Trip duration is shorter than the number of requested "
             "destinations; only the first destinations can receive a day."
@@ -171,6 +131,7 @@ def allocate_days_for_route(
 
     allocation = [total_days // n] * n
     remainder = total_days % n
+
     for index in range(remainder):
         allocation[index] += 1
 
@@ -179,33 +140,56 @@ def allocate_days_for_route(
     for i in range(1, n):
         previous_destination = destination_ids[i - 1]
         current_destination = destination_ids[i]
+
         previous_country = meta.get(previous_destination, {}).get("country")
         current_country = meta.get(current_destination, {}).get("country")
 
-        if not (previous_country and current_country and previous_country != current_country):
+        if not (
+            previous_country
+            and current_country
+            and previous_country != current_country
+        ):
             continue
+
         if BORDER_BUFFER_NIGHTS <= 0:
             continue
 
         donor_candidates: list[tuple[int, int]] = []
+
         for donor_index in range(n):
-            minimum = meta.get(destination_ids[donor_index], {}).get("min_nights", 1)
+            minimum = meta.get(
+                destination_ids[donor_index],
+                {},
+            ).get("min_nights", 1)
+
             slack = allocation[donor_index] - minimum
-            # >= BORDER_BUFFER_NIGHTS, not > 0, so a destination can
-            # never be donated from below its recommended minimum.
+
             if slack >= BORDER_BUFFER_NIGHTS:
-                donor_candidates.append((slack, donor_index))
+                donor_candidates.append(
+                    (slack, donor_index)
+                )
 
         if not donor_candidates:
-            label = meta.get(current_destination, {}).get("headline_label", current_destination)
+            label = meta.get(
+                current_destination,
+                {},
+            ).get(
+                "headline_label",
+                current_destination,
+            )
+
             warnings.append(
-                f"Could not add a border-buffer night before entering {label} "
-                "without shortening another destination below its recommended "
-                "minimum stay."
+                f"Could not add a border-buffer night before entering "
+                f"{label} without shortening another destination below "
+                f"its recommended minimum stay."
             )
             continue
 
-        _, donor_index = max(donor_candidates, key=lambda item: item[0])
+        _, donor_index = max(
+            donor_candidates,
+            key=lambda item: item[0],
+        )
+
         if donor_index == i:
             continue
 
@@ -213,20 +197,33 @@ def allocate_days_for_route(
         allocation[i] += BORDER_BUFFER_NIGHTS
 
     if any(value < 0 for value in allocation):
-        logger.error("Negative day allocation detected: %s", allocation)
-        allocation = [max(0, value) for value in allocation]
+        logger.error(
+            "Negative day allocation detected: %s",
+            allocation,
+        )
+
+        allocation = [
+            max(0, value)
+            for value in allocation
+        ]
+
         while sum(allocation) < total_days:
             allocation[-1] += 1
 
     if sum(allocation) != total_days:
-        logger.error("Day allocation invariant violated: %s != %s", sum(allocation), total_days)
+        logger.error(
+            "Day allocation invariant violated: %s != %s",
+            sum(allocation),
+            total_days,
+        )
+
         allocation[-1] += total_days - sum(allocation)
 
     return allocation, warnings
 
 
 # ============================================================================
-# ROUTE GEOGRAPHY -> DAY ARCHETYPE INPUT
+# ROUTE LEG -> DAY RECORD
 # ============================================================================
 
 def day_record_from_route_leg(
@@ -241,48 +238,104 @@ def day_record_from_route_leg(
     destination_type: str | None,
 ) -> dict[str, Any]:
     """
-    Build one day_archetype.py-compatible day record.
+    Build one DayArchetype-compatible record.
 
-    ``leg`` is the RouteLeg that lands on this day (i.e. the transfer
-    INTO the destination for this shelf), or None if this day has no
-    transfer (a normal activity day mid-stay).
+    Critical distinction
+    --------------------
+    `is_destination_transition` means:
 
-    day_archetype.py's _signals_from_record() reads travel_hours,
-    transfer flag, crosses_country, border_crossing, and the
-    has_safari/has_beach/etc. flags via a free-text scan of
-    destination_type -- see _extract_activity_flags in that file. We
-    populate destination_type directly and let that engine's own text
-    matching derive the has_* flags; we do not attempt to duplicate
-    that classification logic here.
+        "A route leg actually moves the traveler from one requested
+         destination to another."
+
+    It does NOT mean:
+
+        "We know how long that movement takes."
+
+    Therefore an unavailable RouteLeg is still a valid transition and
+    must still be capable of producing a TRANSIT Shelf.
     """
 
     record: dict[str, Any] = {
+        "day_number": day_number,
         "arrival": is_first_day,
         "departure": is_last_day,
         "destination_type": destination_type,
         "activity_count": activity_count,
+
+        # Explicit semantic flags used by the pipeline adapter.
+        "is_destination_transition": False,
+        "route_duration_available": False,
+        "route_unavailable": False,
+        "requires_transit_day": False,
     }
 
     if leg is not None:
-        record["transfer"] = True
-        record["travel_hours"] = minutes_to_hours(leg.duration_minutes)
-        record["travel_distance_km"] = leg.distance_km or 0.0
-        record["crosses_country"] = leg.is_inter_country
-        record["border_crossing"] = leg.requires_border_crossing
-        # Carry the raw leg forward for anything that wants to inspect
-        # the un-converted, un-lossy source fact (e.g. whether the
-        # duration is genuinely unavailable vs. a real zero).
-        record["_route_leg"] = leg
-    else:
-        record["transfer"] = is_arrival_day
-        record["travel_hours"] = 0.0
-        record["travel_distance_km"] = 0.0
-        record["crosses_country"] = False
-        record["border_crossing"] = False
-        record["_route_leg"] = None
+        duration_available = (
+            leg.duration_minutes is not None
+        )
+
+        is_destination_transition = True
+
+        record.update(
+            {
+                "transfer": True,
+                "travel_hours": minutes_to_hours(
+                    leg.duration_minutes
+                ),
+                "travel_distance_km": (
+                    leg.distance_km
+                    if leg.distance_km is not None
+                    else 0.0
+                ),
+                "crosses_country": bool(
+                    leg.is_inter_country
+                ),
+                "border_crossing": bool(
+                    leg.requires_border_crossing
+                ),
+
+                # These are intentionally independent of duration.
+                "is_destination_transition": is_destination_transition,
+                "route_duration_available": duration_available,
+                "route_unavailable": not duration_available,
+
+                # A destination-to-destination route transition consumes
+                # the arrival/transfer day regardless of whether the
+                # duration is known.
+                "requires_transit_day": True,
+
+                # Preserve the authoritative source object.
+                "_route_leg": leg,
+            }
+        )
+
+        return record
+
+    # ------------------------------------------------------------------
+    # No destination-to-destination route leg.
+    # ------------------------------------------------------------------
+
+    record.update(
+        {
+            "transfer": bool(is_arrival_day),
+            "travel_hours": 0.0,
+            "travel_distance_km": 0.0,
+            "crosses_country": False,
+            "border_crossing": False,
+            "is_destination_transition": False,
+            "route_duration_available": False,
+            "route_unavailable": False,
+            "requires_transit_day": False,
+            "_route_leg": None,
+        }
+    )
 
     return record
 
+
+# ============================================================================
+# ROUTE ANALYSIS -> DAY RECORDS
+# ============================================================================
 
 def day_records_from_route_analysis(
     *,
@@ -293,182 +346,260 @@ def day_records_from_route_analysis(
     activity_counts_by_day: Mapping[int, int] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Build the full ordered list of day_archetype.py day records for an
-    itinerary, given:
+    Build one ordered day record for every itinerary day.
 
-    - the RouteGeographyEngine's analysis of the destination route
-      (which produces one RouteLeg per destination-to-destination
-      transition, NOT one per day),
-    - how many nights were allocated to each destination in order
-      (from allocate_days_for_route(), called by the orchestrator
-      BEFORE ItineraryPlanningEngine.build() -- see this module's
-      docstring for why that ordering changed),
-    - and, optionally, per-day activity counts (day_number -> count) if
-      already known; days not present default to 0.
+    The route leg between destination A and destination B is attached
+    to the FIRST calendar day allocated to destination B.
 
-    NOTE ON activity_counts_by_day: since this function can now run
-    BEFORE ItineraryPlanningEngine.build() has constructed any Drawers,
-    callers invoking it pre-planning should simply omit this parameter
-    (every day defaults to activity_count=0) -- day_archetype.py's
-    classify_day() does not require a non-zero activity_count to
-    correctly detect LONG_TRANSFER; that classification is driven by
-    travel_hours/transfer flags from the leg data, not by activity
-    counts. activity_counts_by_day remains available for any caller
-    that wants to re-classify AFTER planning (e.g. for a post-hoc
-    ValidationEngine pass) with real counts.
+    That day is explicitly marked:
 
-    The mapping from "N legs between destinations" to "1 day per
-    calendar day" is: the leg immediately preceding a destination lands
-    on that destination's FIRST day only. Every other day at that
-    destination has no leg (transfer=False unless later marked
-    otherwise by the caller).
+        is_destination_transition = True
+        requires_transit_day = True
+
+    even when:
+
+        leg.duration_minutes is None
+
+    This is the critical fix for unavailable inter-destination routes.
     """
 
     if len(destination_order) != len(nights_per_destination):
         raise ValueError(
-            "destination_order and nights_per_destination must be the "
-            "same length "
+            "destination_order and nights_per_destination must be "
+            "the same length "
             f"({len(destination_order)} != {len(nights_per_destination)})."
         )
 
     activity_counts = activity_counts_by_day or {}
 
-    # Legs are keyed by (from_destination_id, to_destination_id) in
-    # RouteAnalysis.legs, in the same order as consecutive DISTINCT
-    # destinations in destination_order. Build a lookup by the
-    # destination the leg arrives AT, since that's what determines
-    # which day it lands on.
+    # One leg per consecutive destination transition.
     leg_by_arrival_destination: dict[str, RouteLeg] = {
-        leg.to_stop.destination_id: leg for leg in route_analysis.legs
+        leg.to_stop.destination_id: leg
+        for leg in route_analysis.legs
     }
 
     destination_types: dict[str, str | None] = {
-        stop.destination_id: stop.destination_type for stop in route_analysis.stops
+        stop.destination_id: stop.destination_type
+        for stop in route_analysis.stops
     }
 
     records: list[dict[str, Any]] = []
+
     day_number = 0
 
-    for destination_index, destination_id in enumerate(destination_order):
-        nights_here = nights_per_destination[destination_index]
+    for destination_index, destination_id in enumerate(
+        destination_order
+    ):
+        nights_here = nights_per_destination[
+            destination_index
+        ]
 
         for night_index in range(nights_here):
             day_number += 1
 
             is_first_day = day_number == 1
             is_last_day = day_number == total_days
-            is_arrival_day = night_index == 0 and destination_index > 0
+
+            is_arrival_day = (
+                night_index == 0
+                and destination_index > 0
+            )
 
             leg = (
-                leg_by_arrival_destination.get(destination_id)
+                leg_by_arrival_destination.get(
+                    destination_id
+                )
                 if is_arrival_day
                 else None
             )
 
-            records.append(
-                day_record_from_route_leg(
-                    day_number=day_number,
-                    total_days=total_days,
-                    is_first_day=is_first_day,
-                    is_last_day=is_last_day,
-                    is_arrival_day=is_arrival_day,
-                    leg=leg,
-                    activity_count=activity_counts.get(day_number, 0),
-                    destination_type=destination_types.get(destination_id),
-                )
+            record = day_record_from_route_leg(
+                day_number=day_number,
+                total_days=total_days,
+                is_first_day=is_first_day,
+                is_last_day=is_last_day,
+                is_arrival_day=is_arrival_day,
+                leg=leg,
+                activity_count=activity_counts.get(
+                    day_number,
+                    0,
+                ),
+                destination_type=destination_types.get(
+                    destination_id
+                ),
             )
 
+            records.append(record)
+
+    # Defensive invariant:
+    # the number of generated records must match the requested trip days.
+    if len(records) != total_days:
+        raise ValueError(
+            "Generated day records do not match total_days: "
+            f"{len(records)} != {total_days}"
+        )
+
     return records
+
+
+# ============================================================================
+# EXPLICIT TRANSIT-DAY EXTRACTION
+# ============================================================================
+
+def transit_days_from_day_records(
+    day_records: list[Mapping[str, Any]],
+) -> dict[int, bool]:
+    """
+    Extract the authoritative transit-day decision directly from the
+    route-aware day records.
+
+    This is intentionally NOT based on DayArchetype.
+
+    Why?
+
+    DayArchetype answers:
+
+        "What kind of day is this?"
+
+    Transit-day persistence answers:
+
+        "Does this day contain a destination-to-destination transition?"
+
+    Those are related but not identical questions.
+
+    Most importantly, an unavailable route duration must not prevent a
+    real destination transition from becoming a TRANSIT Shelf.
+    """
+
+    transit_days: dict[int, bool] = {}
+
+    for record in day_records:
+        day_number = record.get("day_number")
+
+        if day_number is None:
+            continue
+
+        transit_days[int(day_number)] = bool(
+            record.get("requires_transit_day", False)
+        )
+
+    return transit_days
 
 
 # ============================================================================
 # DAY ARCHETYPE OUTPUT -> VALIDATION ENGINE INPUT
 # ============================================================================
 
-# Archetypes for which an overnight Headboard is NOT expected. Kept as
-# an explicit allowlist (rather than "everything except NORMAL") so
-# that adding a new DayArchetype value in the future does not silently
-# change validation behavior -- a new archetype defaults to requiring
-# accommodation until someone deliberately adds it here.
-_ARCHETYPES_WITHOUT_OVERNIGHT_REQUIREMENT = frozenset({"departure"})
+_ARCHETYPES_WITHOUT_OVERNIGHT_REQUIREMENT = frozenset(
+    {"departure"}
+)
 
 
 def overnight_required_from_day_plan(day_plan) -> dict[int, bool]:
     """
-    Build the ``overnight_required`` mapping ValidationEngine.validate()
-    accepts, from a day_archetype.DayArchetypePlan.
-
-    day_plan.days is a tuple of DayArchetypeResult, each with
-    .day_number and .archetype (a DayArchetype enum whose .value is a
-    lowercase string, e.g. "departure").
+    Build the overnight_required mapping consumed by ValidationEngine.
     """
 
     return {
         day.day_number: (
-            day.archetype.value not in _ARCHETYPES_WITHOUT_OVERNIGHT_REQUIREMENT
+            day.archetype.value
+            not in _ARCHETYPES_WITHOUT_OVERNIGHT_REQUIREMENT
         )
         for day in day_plan.days
     }
 
 
 # ============================================================================
-# DAY ARCHETYPE OUTPUT -> ITINERARY PLANNING ENGINE INPUT (transit days)
+# DAY ARCHETYPE OUTPUT -> TRANSIT FALLBACK
 # ============================================================================
 
-# Archetypes that mean "this day's primary content is a long-haul
-# transfer" -- ItineraryPlanningEngine uses this mapping to decide
-# whether to build the normal activity template for a day or the
-# TRANSIT-day template (no forced activity slot; see
-# itineraryPlanningEngine.py's _populate_drawers()). Sourced from
-# day_archetype.py's own DayArchetype enum -- LONG_TRANSFER is the
-# archetype classify_day() assigns when travel_hours crosses that
-# module's LONG_TRAVEL_HOURS/VERY_LONG_TRAVEL_HOURS thresholds. No new
-# thresholds are introduced here; this is purely a lookup of an
-# already-computed classification.
-_ARCHETYPES_REQUIRING_TRANSIT_DAY = frozenset({"long_transfer"})
-
-
-def transit_days_from_day_plan(day_plan) -> dict[int, bool]:
-    """
-    Build a day_number -> is_transit_day mapping from a
-    day_archetype.DayArchetypePlan, for ItineraryPlanningEngine.build()
-    to consult when constructing each Shelf's drawers.
-
-    A day not present in day_plan (should not normally happen -- every
-    day the orchestrator allocates is classified) is treated as NOT a
-    transit day by the caller's default handling (see
-    itineraryPlanningEngine.py: `.get(day_number, False)`), matching
-    the same "unknown defaults to the conservative/existing behavior"
-    convention used by overnight_required_from_day_plan above.
-    """
-
-    return {
-        day.day_number: (day.archetype.value in _ARCHETYPES_REQUIRING_TRANSIT_DAY)
-        for day in day_plan.days
+_ARCHETYPES_REQUIRING_TRANSIT_DAY = frozenset(
+    {
+        "long_transfer",
+        "transfer",
+        "overnight_transition",
     }
+)
 
 
-# ============================================================================
-# CABINET / SHELF / DRAWER ORM -> SCHEDULE_REPAIR / ACTIVITY_CONSTRAINTS INPUT
-# ============================================================================
-
-def activity_record_from_drawer(drawer: Any) -> dict[str, Any]:
+def transit_days_from_day_plan(
+    day_plan,
+    day_records: list[Mapping[str, Any]] | None = None,
+) -> dict[int, bool]:
     """
-    Build one activity_constraints.py-compatible activity record from a
-    persisted Drawer ORM row.
+    Build the transit-day mapping.
 
-    Only EXPERIENCE-type drawers represent bookable/schedulable
-    activities in the sense activity_constraints.py models (duration,
-    intensity, opening hours, etc.); MEAL/TRANSFER/ARRIVAL/DEPARTURE
-    drawers are structural itinerary entries, not activities with
-    constraints, so callers should filter to activity_type ==
-    "EXPERIENCE" before calling this (see schedule_record_from_shelf
-    below, which does this filtering).
+    Primary source
+    --------------
+    Route-aware day records.
 
-    activity_constraints.normalize_activity() already tolerates missing
-    fields via safe_* helpers and falls back to
-    DEFAULT_ACTIVITY_DURATION_HOURS -- we do not need to fabricate
-    values here, only pass through what the Drawer actually has.
+    Fallback source
+    --------------
+    DayArchetype classification.
+
+    The route-aware source is authoritative because a route can be
+    unavailable while still being a genuine destination transition.
+
+    Example:
+
+        Ngorongoro -> Pyramids
+        duration = None
+
+    DayArchetype may classify this as SAFARI because it cannot infer
+    travel hours from None.
+
+    That must NOT erase the route transition.
+
+    Therefore:
+
+        route record says TRANSIT -> True
+        archetype says SAFARI -> irrelevant
+
+    The fallback to archetype exists only for compatibility with
+    callers that do not provide day_records.
+    """
+
+    result: dict[int, bool] = {}
+
+    # ---------------------------------------------------------------
+    # Authoritative route-aware decision.
+    # ---------------------------------------------------------------
+    if day_records is not None:
+        result.update(
+            transit_days_from_day_records(
+                day_records
+            )
+        )
+
+    # ---------------------------------------------------------------
+    # Archetype fallback / compatibility.
+    # ---------------------------------------------------------------
+    for day in day_plan.days:
+        day_number = day.day_number
+
+        archetype_requires_transit = (
+            day.archetype.value
+            in _ARCHETYPES_REQUIRING_TRANSIT_DAY
+        )
+
+        # Never downgrade an explicit route transition.
+        result[day_number] = bool(
+            result.get(day_number, False)
+            or archetype_requires_transit
+        )
+
+    return result
+
+
+# ============================================================================
+# ACTIVITY CONSTRAINTS ADAPTER
+# ============================================================================
+
+def activity_record_from_drawer(
+    drawer: Any,
+) -> dict[str, Any]:
+    """
+    Build an activity_constraints-compatible record from a Drawer ORM row.
     """
 
     record: dict[str, Any] = {
@@ -477,36 +608,35 @@ def activity_record_from_drawer(drawer: Any) -> dict[str, Any]:
     }
 
     if drawer.duration_minutes is not None:
-        record["duration_minutes"] = drawer.duration_minutes
-
-    # Doc 6's Drawer schema does not currently carry earliest_start,
-    # opening_hours, min_age, incompatible_with, booking_required, or
-    # any of the other richer fields activity_constraints.py can
-    # consume (see the audit note: "activity schema not yet
-    # confirmed"). We deliberately do NOT populate those keys with
-    # guessed values -- normalize_activity() already defaults them to
-    # None/unknown when absent, which is the correct behavior until
-    # the underlying activities table is confirmed to carry that data.
+        record["duration_minutes"] = (
+            drawer.duration_minutes
+        )
 
     record["fixed_time"] = drawer.activity_type in {
-        "ARRIVAL", "DEPARTURE", "TRANSFER", "MEAL",
+        "ARRIVAL",
+        "DEPARTURE",
+        "TRANSFER",
+        "MEAL",
     }
 
     if drawer.start_time is not None:
-        record["start_time"] = drawer.start_time.strftime("%H:%M")
+        record["start_time"] = (
+            drawer.start_time.strftime("%H:%M")
+        )
 
     record["_drawer_id"] = drawer.id
-    record["_is_fallback"] = bool(getattr(drawer, "is_fallback", False))
+    record["_is_fallback"] = bool(
+        getattr(drawer, "is_fallback", False)
+    )
 
     return record
 
 
-def schedule_record_from_shelf(shelf: Any) -> dict[str, Any]:
+def schedule_record_from_shelf(
+    shelf: Any,
+) -> dict[str, Any]:
     """
-    Build one schedule_repair.py-compatible day record (the ``days``
-    parameter to ScheduleRepairEngine.repair()) from a persisted Shelf
-    ORM row, including only its EXPERIENCE-type drawers as schedulable
-    activities.
+    Build one ScheduleRepair-compatible day record.
     """
 
     activities = [
@@ -521,29 +651,34 @@ def schedule_record_from_shelf(shelf: Any) -> dict[str, Any]:
     }
 
 
-def schedule_input_from_cabinet(cabinet: Any) -> list[dict[str, Any]]:
+def schedule_input_from_cabinet(
+    cabinet: Any,
+) -> list[dict[str, Any]]:
     """
-    Build the full ``days`` list schedule_repair.py's
-    ScheduleRepairEngine.repair() expects, from a persisted Cabinet.
-
-    Shelves are already stored in day_number order (see
-    Cabinet.shelves relationship's order_by="Shelf.day_number" in
-    models_furniture.py), so no re-sorting is performed here -- doing
-    so would risk silently masking a persistence bug where shelves were
-    written out of order.
+    Build the complete ScheduleRepair input from a Cabinet.
     """
 
-    return [schedule_record_from_shelf(shelf) for shelf in cabinet.shelves]
+    return [
+        schedule_record_from_shelf(shelf)
+        for shelf in cabinet.shelves
+    ]
 
 
-def archetypes_by_day_number(day_plan) -> dict[int, Any]:
+# ============================================================================
+# ARCHETYPE LOOKUP
+# ============================================================================
+
+def archetypes_by_day_number(
+    day_plan,
+) -> dict[int, Any]:
     """
-    Build the ``archetypes: Mapping[int, DayArchetype]`` parameter
-    schedule_repair.py's repair()/validate() accept, from a
-    day_archetype.DayArchetypePlan.
+    Build day_number -> DayArchetype mapping.
     """
 
-    return {day.day_number: day.archetype for day in day_plan.days}
+    return {
+        day.day_number: day.archetype
+        for day in day_plan.days
+    }
 
 
 __all__ = [
@@ -552,6 +687,7 @@ __all__ = [
     "allocate_days_for_route",
     "day_record_from_route_leg",
     "day_records_from_route_analysis",
+    "transit_days_from_day_records",
     "overnight_required_from_day_plan",
     "transit_days_from_day_plan",
     "activity_record_from_drawer",
