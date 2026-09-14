@@ -45,15 +45,33 @@ No-fabrication rules
 - Preserve the route order supplied by the orchestrator.
 - Never globally deduplicate destination IDs.
 - Real route duration is preferred.
-- Unknown route duration remains unknown in displayed text.
-- Internal fallback durations are for scheduling only and are marked
-  as fallback.
+- Unknown route duration remains unknown internally.
+- Internal fallback durations are for scheduling only.
 - Never invent airport names, airport transfers, attraction names,
   flight modes, drive modes, lodge names, or route durations.
 - Only game-drive drawers receive absolute clock times.
 - Other drawers use duration_minutes + sort_order.
 - Destination transitions and transit days are distinct concepts.
 - Transit classification comes from the orchestrator.
+
+Presentation rule
+-----------------
+Missing backend facts must not be exposed as database/system failures
+to the traveler.
+
+Therefore:
+- no "duration unavailable"
+- no "transport details unavailable"
+- no "confirm before booking" caused by missing planner data
+- no fabricated transport mode
+- no fabricated transport duration
+
+If a transport fact is unknown, the planner either:
+1. presents a neutral transfer label, or
+2. omits the Armrest record when the persisted schema requires a
+   non-null transport mode.
+
+The latter is important because armrests.mode is NOT NULL.
 """
 
 from __future__ import annotations
@@ -86,14 +104,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_GAME_DRIVE_START = dt_time(6, 0)
 EVENING_GAME_DRIVE_START = dt_time(16, 0)
 
-# These are NOT route facts. They exist only so the furniture scheduler
-# has a finite duration where the database contains no duration.
-# The displayed description must continue to say that the duration
-# is unavailable.
+# These values are scheduling fallbacks only.
+# They are never treated as factual route durations.
 FALLBACK_ARRIVAL_TRANSFER_MINUTES = 60
 FALLBACK_DEPARTURE_TRANSFER_MINUTES = 60
 FALLBACK_TRANSIT_LEG_MINUTES = 60
-
 FALLBACK_ACTIVITY_DURATION_MINUTES = 120
 FALLBACK_MORNING_ACTIVITY_MINUTES = 240
 FALLBACK_AFTERNOON_ACTIVITY_MINUTES = 150
@@ -404,7 +419,6 @@ def _fallback_drawer_text(
     destination_type: str | None,
     variant_index: int,
 ) -> tuple[str, str]:
-
     variants = (
         FALLBACK_VARIANTS.get(
             str(destination_type or "").lower(),
@@ -422,9 +436,9 @@ def _merged_ranked_categories(
     travel_style: list[str],
     focus: str | None = None,
 ) -> list[str]:
-
     seen: set[str] = set()
     result: list[str] = []
+
     tags: list[str] = []
 
     if focus:
@@ -463,7 +477,26 @@ def _format_transfer_description(
     mode: str | None,
     minutes: int | None,
 ) -> str:
+    """
+    Create neutral traveler-facing transport text.
 
+    Important:
+    Unknown duration is NOT exposed as a backend/data-quality
+    failure. Unknown mode is also never fabricated.
+
+    Examples:
+        known mode + known duration:
+            "Road transfer · approximately 90 min"
+
+        known mode + unknown duration:
+            "Road transfer"
+
+        unknown mode + known duration:
+            "Transfer · approximately 90 min"
+
+        unknown mode + unknown duration:
+            "Transfer"
+    """
     normalized_mode = (
         str(mode).strip().lower()
         if mode
@@ -485,10 +518,7 @@ def _format_transfer_description(
     )
 
     if minutes is None:
-        return (
-            f"{mode_label} · duration unavailable — "
-            "confirm before booking"
-        )
+        return mode_label
 
     return (
         f"{mode_label} · approximately "
@@ -499,7 +529,6 @@ def _format_transfer_description(
 def _normalise_archetype(
     value: Any,
 ) -> str | None:
-
     if value is None:
         return None
 
@@ -532,7 +561,6 @@ def _normalise_archetype(
 def _is_cultural_archetype(
     value: Any,
 ) -> bool:
-
     return _normalise_archetype(value) in {
         "cultural",
         "culture",
@@ -563,7 +591,6 @@ class ItineraryPlanningEngine:
         self,
         destination_ids: list[str],
     ) -> dict[str, dict[str, Any]]:
-
         return self._fetch_destination_meta(
             destination_ids
         )
@@ -626,6 +653,7 @@ class ItineraryPlanningEngine:
         # Do not silently force wildlife when the caller did not
         # specify a focus. The Rules/UI/orchestrator layer owns
         # request defaults.
+
         focus_raw = request.get("focus")
 
         focus = (
@@ -825,7 +853,6 @@ class ItineraryPlanningEngine:
         ] = {}
 
         for destination_id in destination_ids:
-
             pool = self._fetch_ranked_activity_pool(
                 dest_id=destination_id,
                 destination_type=destination_types.get(
@@ -873,7 +900,6 @@ class ItineraryPlanningEngine:
         for destination_index, destination_id in enumerate(
             destination_ids
         ):
-
             allocated_days = normalized_allocation[
                 destination_index
             ]
@@ -913,6 +939,7 @@ class ItineraryPlanningEngine:
                 # departure day. Transit classification supplied by
                 # the orchestrator wins over the generic calendar
                 # endpoint meaning.
+
                 effective_departure_day = (
                     is_last_day
                     and not is_transit_day
@@ -965,7 +992,6 @@ class ItineraryPlanningEngine:
                         cursor=cursors,
                         fallback_counters=fallback_counters,
                         dest_id=destination_id,
-                        origin_dest_id=origin_dest_id,
                         dest_type=destination_type,
                         travel_style=travel_style,
                         focus=focus,
@@ -977,6 +1003,7 @@ class ItineraryPlanningEngine:
                         day_archetype=archetype,
                         legs=legs,
                         destination_index=destination_index,
+                        origin_dest_id=origin_dest_id,
                     )
                 )
 
@@ -1039,7 +1066,6 @@ class ItineraryPlanningEngine:
         value: Any,
         default: int = 0,
     ) -> int:
-
         try:
             return int(value)
         except (
@@ -1052,7 +1078,6 @@ class ItineraryPlanningEngine:
     def _normalize_destination_ids(
         destination_ids: list[str],
     ) -> list[str]:
-
         """
         Preserve route order.
 
@@ -1063,19 +1088,15 @@ class ItineraryPlanningEngine:
         Does NOT remove non-consecutive repeats.
 
         Therefore:
-
             A -> B -> A
 
         remains:
-
             A -> B -> A
         """
-
         result: list[str] = []
         previous: str | None = None
 
         for raw_id in destination_ids:
-
             if raw_id is None:
                 continue
 
@@ -1132,7 +1153,6 @@ class ItineraryPlanningEngine:
         ] = {}
 
         for row in rows:
-
             destination_id = str(
                 row[0]
             )
@@ -1144,10 +1164,10 @@ class ItineraryPlanningEngine:
                 "min_nights": 1,
             }
 
-        # Minimum-night information belongs to feasibility/allocation.
-        # This planner only reads it.
-        try:
+        # Minimum-night information belongs to
+        # feasibility/allocation. This planner only reads it.
 
+        try:
             table_exists = self.db.execute(
                 text(
                     """
@@ -1159,7 +1179,6 @@ class ItineraryPlanningEngine:
             ).scalar()
 
             if table_exists:
-
                 min_rows = self.db.execute(
                     text(
                         """
@@ -1206,7 +1225,6 @@ class ItineraryPlanningEngine:
                         )
 
         except Exception as exc:
-
             logger.warning(
                 "Could not read estimated_visit_durations "
                 "minimum nights: %s",
@@ -1224,7 +1242,6 @@ class ItineraryPlanningEngine:
     ) -> str | None:
 
         try:
-
             inspector = inspect(
                 self.db.bind
             )
@@ -1237,7 +1254,6 @@ class ItineraryPlanningEngine:
             }
 
         except Exception:
-
             return None
 
         candidates = (
@@ -1249,7 +1265,6 @@ class ItineraryPlanningEngine:
         )
 
         for candidate in candidates:
-
             if candidate in columns:
                 return candidate
 
@@ -1288,7 +1303,6 @@ class ItineraryPlanningEngine:
         )
 
         if duration_column:
-
             duration_expression = (
                 f"evd.{duration_column}"
             )
@@ -1298,9 +1312,7 @@ class ItineraryPlanningEngine:
                     ON evd.activity_id = a.id
                    AND evd.scope = 'single_activity'
             """
-
         else:
-
             duration_expression = "NULL"
             duration_join = ""
 
@@ -1315,7 +1327,6 @@ class ItineraryPlanningEngine:
                         AS category,
                     a.difficulty,
                     a.available_months,
-
                     {duration_expression}
                         AS estimated_visit_duration_minutes,
 
@@ -1396,11 +1407,9 @@ class ItineraryPlanningEngine:
         result: list[dict[str, Any]] = []
 
         for row in rows:
-
             duration = row[5]
 
             if duration is not None:
-
                 try:
                     duration = max(
                         1,
@@ -1453,30 +1462,12 @@ class ItineraryPlanningEngine:
     ) -> str | None:
 
         # Structural semantics take precedence.
-        #
-        # First day:
-        # arrival/settling semantics.
-        #
-        # Transit day:
-        # route-transition semantics.
-        #
-        # Last day:
-        # departure semantics, but only if it is not a transit day.
-        #
-        # Cultural archetype:
-        # destination-specific cultural schedule.
-        #
-        # Standard:
-        # destination-specific normal schedule.
-
         if is_first_day:
-
             return self._populate_first_day_drawers(
                 shelf=shelf,
             )
 
         if is_transit_day:
-
             return self._populate_transit_day_drawers(
                 shelf=shelf,
                 legs=legs,
@@ -1485,7 +1476,6 @@ class ItineraryPlanningEngine:
             )
 
         if is_last_day:
-
             return self._populate_last_day_drawers(
                 shelf=shelf,
             )
@@ -1493,7 +1483,6 @@ class ItineraryPlanningEngine:
         if _is_cultural_archetype(
             day_archetype
         ):
-
             return self._populate_cultural_day_drawers(
                 shelf=shelf,
                 pool=pool,
@@ -1532,14 +1521,6 @@ class ItineraryPlanningEngine:
         self,
         shelf: Shelf,
     ) -> None:
-
-        """
-        Do not claim airport arrival or invent an airport-to-lodge
-        duration. The planner does not receive an arrival gateway fact.
-
-        The day therefore represents the beginning of the trip without
-        pretending to know how the traveler reaches the destination.
-        """
 
         order = 1
 
@@ -1596,13 +1577,6 @@ class ItineraryPlanningEngine:
         shelf: Shelf,
     ) -> None:
 
-        """
-        Departure day does not fabricate an airport transfer.
-
-        The planner has no authoritative departure gateway or
-        destination-to-airport route fact in its contract.
-        """
-
         order = 1
 
         self._add_drawer(
@@ -1622,8 +1596,7 @@ class ItineraryPlanningEngine:
             shelf=shelf,
             name="Departure",
             description=(
-                "Trip departure. Final transfer and departure "
-                "timing should be confirmed with the operator."
+                "Trip departure."
             ),
             start_time=None,
             duration_minutes=30,
@@ -1659,21 +1632,18 @@ class ItineraryPlanningEngine:
             )
 
         if leg is None:
-
             logger.warning(
                 "Transit day %s has no matching incoming "
                 "RouteGeography leg.",
                 shelf.day_number,
             )
 
+            # Do not expose the missing route fact.
+            # Keep the drawer neutral.
             self._add_drawer(
                 shelf=shelf,
                 name="Destination transfer",
-                description=(
-                    "This day is classified as a transit day, "
-                    "but no matching route leg was supplied. "
-                    "Transport details remain unavailable."
-                ),
+                description="Transfer to the destination.",
                 start_time=None,
                 duration_minutes=(
                     FALLBACK_TRANSIT_LEG_MINUTES
@@ -1686,7 +1656,6 @@ class ItineraryPlanningEngine:
             )
 
         else:
-
             duration = self._coerce_optional_int(
                 leg.get("duration_minutes")
             )
@@ -1783,7 +1752,6 @@ class ItineraryPlanningEngine:
         first_activity_id: str | None = None
 
         if is_arrival_day:
-
             order, _ = self._destination_arrival_transfer(
                 shelf=shelf,
                 order=order,
@@ -1792,7 +1760,6 @@ class ItineraryPlanningEngine:
                     destination_index=destination_index,
                 ),
             )
-
             order += 1
 
         max_activity_minutes = max(
@@ -2031,7 +1998,6 @@ class ItineraryPlanningEngine:
         first_activity_id: str | None = None
 
         if is_arrival_day:
-
             order, _ = self._destination_arrival_transfer(
                 shelf=shelf,
                 order=order,
@@ -2040,7 +2006,6 @@ class ItineraryPlanningEngine:
                     destination_index=destination_index,
                 ),
             )
-
             order += 1
 
         if is_arrival_day:
@@ -2270,7 +2235,10 @@ class ItineraryPlanningEngine:
 
         leg = legs[expected_from_index]
 
-        if not isinstance(leg, Mapping):
+        if not isinstance(
+            leg,
+            Mapping,
+        ):
             return None
 
         return dict(leg)
@@ -2286,19 +2254,16 @@ class ItineraryPlanningEngine:
 
             logger.warning(
                 "Arrival day %s has no RouteGeography "
-                "transition fact. Transfer duration remains "
-                "unavailable.",
+                "transition fact.",
                 shelf.day_number,
             )
 
+            # Neutral traveler-facing presentation.
+            # The missing fact remains internal.
             self._add_drawer(
                 shelf=shelf,
                 name="Arrival transfer",
-                description=(
-                    "Transfer into the destination. Transport "
-                    "mode and duration are unavailable from "
-                    "the current route data; confirm before booking."
-                ),
+                description="Transfer into the destination.",
                 start_time=None,
                 duration_minutes=(
                     FALLBACK_ARRIVAL_TRANSFER_MINUTES
@@ -2451,6 +2416,7 @@ class ItineraryPlanningEngine:
         cabinet_id = cabinet.id
 
         legs: list[dict[str, Any]] = []
+
         sequence = 0
 
         for index in range(
@@ -2480,16 +2446,13 @@ class ItineraryPlanningEngine:
             ).get("country")
 
             if route_fact is not None:
-
                 is_inter_country = bool(
                     route_fact.get(
                         "is_inter_country",
                         False,
                     )
                 )
-
             else:
-
                 is_inter_country = bool(
                     from_country
                     and to_country
@@ -2545,6 +2508,7 @@ class ItineraryPlanningEngine:
 
                 # Only claim a land-border fact when the authoritative
                 # route fact actually says that one is required.
+
                 requires_border_crossing = bool(
                     route_fact.get(
                         "requires_border_crossing",
@@ -2561,7 +2525,6 @@ class ItineraryPlanningEngine:
                 )
 
             if duration_minutes is None:
-
                 logger.warning(
                     "Route duration unavailable for "
                     "%s -> %s. No duration is invented.",
@@ -2570,7 +2533,6 @@ class ItineraryPlanningEngine:
                 )
 
             if mode is None:
-
                 logger.warning(
                     "Route transport mode unavailable for "
                     "%s -> %s. No transport mode is invented.",
@@ -2603,6 +2565,7 @@ class ItineraryPlanningEngine:
                 "cabinet",
             ):
                 hinge.cabinet = cabinet
+
             elif hinge not in cabinet.hinges:
                 cabinet.hinges.append(hinge)
 
@@ -2632,7 +2595,6 @@ class ItineraryPlanningEngine:
         from_destination: str,
         to_destination: str,
     ) -> dict[str, Any] | None:
-
         """
         Exact transition matching.
 
@@ -2766,7 +2728,6 @@ class ItineraryPlanningEngine:
         remaining_nights_here: int,
         warnings: list[str],
     ) -> None:
-
         """
         Accommodation is only persisted when a real lodge record
         exists.
@@ -2874,12 +2835,30 @@ class ItineraryPlanningEngine:
         destination_index: int,
         is_arrival_day: bool,
     ) -> None:
-
         """
         Armrest represents inter-destination transport only when the
         current day actually corresponds to a route transition.
 
-        It must not display "Private 4x4" on every normal safari day.
+        Important schema rule:
+            armrests.mode is NOT NULL.
+
+        Therefore an Armrest row cannot represent an unknown transport
+        mode with mode=None.
+
+        We do NOT invent a sentinel such as:
+            "unknown"
+            "transfer"
+            "road_transfer"
+            "private_4x4"
+
+        Instead, when the authoritative route fact does not provide a
+        mode, the Armrest record is omitted. The route fact remains
+        represented by the Hinge and the neutral Drawer presentation.
+
+        This prevents the confirmed PostgreSQL error:
+
+            null value in column "mode" of relation "armrests"
+            violates not-null constraint
         """
 
         if not is_arrival_day:
@@ -2892,37 +2871,51 @@ class ItineraryPlanningEngine:
 
         if leg is None:
 
-            armrest = Armrest(
-                shelf_id=shelf.id,
-                mode=None,
-                description=(
-                    "Arrival transport details unavailable "
-                    "from the current route data."
-                ),
-                duration_minutes=None,
-                is_private=False,
+            logger.warning(
+                "Arrival day %s has no RouteGeography "
+                "transport leg. Armrest omitted because "
+                "armrests.mode is NOT NULL.",
+                shelf.day_number,
             )
 
-            self.db.add(armrest)
             return
 
         minutes = self._coerce_optional_int(
             leg.get("duration_minutes")
         )
 
+        raw_mode = leg.get("mode")
+
         mode = (
-            str(leg.get("mode")).strip()
-            if leg.get("mode")
+            str(raw_mode).strip()
+            if raw_mode
             else None
         )
+
+        # Confirmed production constraint:
+        # armrests.mode cannot be NULL.
+        #
+        # Do not fabricate a transport mode merely to satisfy
+        # persistence. The Hinge remains the authoritative route fact.
+
+        if not mode:
+            logger.warning(
+                "Arrival transport mode is unknown for "
+                "day %s. Armrest omitted rather than "
+                "fabricating mode.",
+                shelf.day_number,
+            )
+            return
 
         description = _format_transfer_description(
             mode=mode,
             minutes=minutes,
         )
 
+        normalized_mode = mode.strip().lower()
+
         is_private = (
-            mode == "private_4x4"
+            normalized_mode == "private_4x4"
         )
 
         armrest = Armrest(
@@ -2985,7 +2978,6 @@ class ItineraryPlanningEngine:
     ) -> None:
 
         try:
-
             exists = self.db.execute(
                 text(
                     """
@@ -2997,12 +2989,10 @@ class ItineraryPlanningEngine:
             ).scalar()
 
         except Exception as exc:
-
             logger.warning(
                 "Could not check photo_states table: %s",
                 exc,
             )
-
             return
 
         if not exists:
@@ -3011,7 +3001,6 @@ class ItineraryPlanningEngine:
         row = None
 
         try:
-
             row = self.db.execute(
                 text(
                     """
@@ -3030,7 +3019,6 @@ class ItineraryPlanningEngine:
             ).fetchone()
 
         except Exception as exc:
-
             logger.debug(
                 "Activity-specific photo lookup unavailable: %s",
                 exc,
@@ -3039,7 +3027,6 @@ class ItineraryPlanningEngine:
         if not row:
 
             try:
-
                 row = self.db.execute(
                     text(
                         """
@@ -3058,7 +3045,6 @@ class ItineraryPlanningEngine:
                 ).fetchone()
 
             except Exception as exc:
-
                 logger.debug(
                     "Destination photo lookup unavailable: %s",
                     exc,
@@ -3137,7 +3123,6 @@ class ItineraryPlanningEngine:
             "national_park",
             "game_reserve",
         }:
-
             return (
                 "Wildlife & wide horizons"
                 if night_idx == 0
@@ -3181,6 +3166,7 @@ class ItineraryPlanningEngine:
         focus = request.get("focus")
 
         if focus:
+
             normalized_focus = (
                 str(focus).strip().lower()
             )
@@ -3195,6 +3181,7 @@ class ItineraryPlanningEngine:
                 "birding",
                 "walking",
             }:
+
                 styles.append(
                     normalized_focus
                 )
@@ -3219,9 +3206,10 @@ class ItineraryPlanningEngine:
         ):
             styles.append("private")
 
-        # Relaxed pace remains an inferred product style. It does not
-        # override explicit focus and does not create factual transport
-        # or attraction data.
+        # Relaxed pace remains an inferred product style.
+        # It does not override explicit focus and does not create
+        # factual transport or attraction data.
+
         styles.append("relaxed_pace")
 
         return list(
