@@ -2,7 +2,18 @@
 Schedule Repair Engine
 ======================
 
-Deterministic itinerary schedule validation and repair.
+Deterministic itinerary schedule validation and conservative repair.
+
+Design principles
+-----------------
+1. Repair timing before moving activities.
+2. Never move an activity between different destinations.
+3. Never move route-transfer activities between days.
+4. Never move fixed-time activities.
+5. Preserve factual fixed game-drive times.
+6. Never invent transport, destinations, or activities.
+7. Never use schedule repair to compensate for a broken route.
+8. If a conflict cannot be safely repaired, leave it in place and report it.
 """
 
 from __future__ import annotations
@@ -20,14 +31,20 @@ from app.engines.activity_constraints import (
 )
 from app.engines.day_archetype import (
     DayArchetype,
-    DayArchetypeResult,
 )
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Scheduling constants
+# ---------------------------------------------------------------------------
+
 DEFAULT_DAY_START_MINUTES = 7 * 60
 DEFAULT_DAY_END_MINUTES = 21 * 60
+
 MIN_ACTIVITY_GAP_MINUTES = 15
+
 ARRIVAL_DAY_MAX_ACTIVITY_HOURS = 5.0
 DEPARTURE_DAY_MAX_ACTIVITY_HOURS = 4.0
 TRANSFER_DAY_MAX_ACTIVITY_HOURS = 5.0
@@ -35,7 +52,14 @@ LONG_TRANSFER_MAX_ACTIVITY_HOURS = 3.0
 RECOVERY_DAY_MAX_ACTIVITY_HOURS = 4.0
 NORMAL_DAY_MAX_ACTIVITY_HOURS = 8.0
 INTENSE_DAY_MAX_ACTIVITY_HOURS = 6.0
+
 MAX_REPAIR_ITERATIONS = 100
+MAX_SEARCH_ITERATIONS = 100
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
 
 
 class RepairActionType(str, Enum):
@@ -59,6 +83,11 @@ class ConflictType(str, Enum):
     TRAVEL_CONFLICT = "travel_conflict"
     INVALID_DURATION = "invalid_duration"
     UNSATISFIABLE = "unsatisfiable"
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -91,6 +120,90 @@ class ScheduledActivity:
             self.end_minutes
             + self.travel_after_minutes
             + self.activity.recovery_minutes
+        )
+
+    @property
+    def destination_id(self) -> str | None:
+        """
+        Destination associated with this activity.
+
+        Planner-generated records should always populate this.
+        Missing destination identity is deliberately treated as unknown,
+        not guessed.
+        """
+        value = self.raw.get("destination_id")
+
+        if value is None:
+            return None
+
+        text = str(value).strip()
+
+        return text or None
+
+    @property
+    def activity_type(self) -> str:
+        value = (
+            self.raw.get("activity_type")
+            or self.raw.get("type")
+            or self.raw.get("category")
+            or ""
+        )
+
+        return str(value).strip().lower()
+
+    @property
+    def is_transfer_activity(self) -> bool:
+        """
+        Identify activities representing inter-destination movement.
+
+        This is intentionally conservative. An activity named "transfer"
+        alone is not enough unless its record also carries transfer-like
+        semantic information.
+        """
+
+        activity_type = self.activity_type
+
+        if activity_type in {
+            "transfer",
+            "transit",
+            "transport",
+            "inter_destination_transfer",
+            "route_transfer",
+            "long_transfer",
+            "overnight_transition",
+        }:
+            return True
+
+        text = " ".join(
+            str(
+                self.raw.get(key, "")
+            ).strip().lower()
+            for key in (
+                "name",
+                "description",
+                "category",
+                "activity_type",
+            )
+        )
+
+        transfer_terms = (
+            "transfer to",
+            "transfer from",
+            "inter-destination",
+            "inter destination",
+            "route transfer",
+            "travel day",
+            "travel to",
+            "travel from",
+            "drive to",
+            "drive from",
+            "flight to",
+            "flight from",
+        )
+
+        return any(
+            term in text
+            for term in transfer_terms
         )
 
 
@@ -139,28 +252,57 @@ class ScheduleRepairResult:
     iterations: int
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
+# ---------------------------------------------------------------------------
+# Safe conversion helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_int(
+    value: Any,
+    default: int = 0,
+) -> int:
     if value is None:
         return default
+
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
 
 
-def _safe_bool(value: Any) -> bool:
+def _safe_bool(
+    value: Any,
+) -> bool:
     if isinstance(value, bool):
         return value
+
     if value is None:
         return False
+
     if isinstance(value, str):
-        return value.lower().strip() in {"true", "1", "yes", "fixed"}
+        return value.lower().strip() in {
+            "true",
+            "1",
+            "yes",
+            "fixed",
+        }
+
     if isinstance(value, (int, float)):
         return value != 0
+
     return False
 
 
-def _parse_time(value: Any) -> int | None:
+def _parse_time(
+    value: Any,
+) -> int | None:
+    """
+    Parse a time value into minutes after midnight.
+
+    Unlike the previous implementation, this does not use `value or ...`,
+    so valid zero values are preserved.
+    """
+
     if value is None:
         return None
 
@@ -180,13 +322,31 @@ def _parse_time(value: Any) -> int | None:
     if not text:
         return None
 
-    parts = text.split(":")
+    # Support basic AM/PM values as well as HH:MM.
+    upper = text.upper()
+
+    is_pm = upper.endswith("PM")
+    is_am = upper.endswith("AM")
+
+    if is_pm or is_am:
+        upper = upper[:-2].strip()
+
+    parts = upper.split(":")
 
     try:
         hour = int(parts[0])
         minute = int(parts[1]) if len(parts) > 1 else 0
-    except ValueError:
+    except (TypeError, ValueError):
         return None
+
+    if is_pm:
+        if hour == 12:
+            hour = 12
+        else:
+            hour += 12
+
+    elif is_am and hour == 12:
+        hour = 0
 
     if not 0 <= hour <= 23:
         return None
@@ -206,8 +366,9 @@ def _windows_allow(
         return True
 
     return any(
-        w.contains(start) and w.contains(end)
-        for w in windows
+        window.contains(start)
+        and window.contains(end)
+        for window in windows
     )
 
 
@@ -218,11 +379,13 @@ def _next_window_start(
     if not windows:
         return start
 
-    candidates = []
+    candidates: list[int] = []
 
     for window in windows:
         if start <= window.start_minutes:
-            candidates.append(window.start_minutes)
+            candidates.append(
+                window.start_minutes
+            )
         elif window.contains(start):
             candidates.append(start)
 
@@ -236,7 +399,14 @@ def _activity_end(
     activity: ActivityProfile,
     start_minutes: int,
 ) -> int:
-    return start_minutes + int(round(activity.duration_hours * 60))
+    return (
+        start_minutes
+        + int(
+            round(
+                activity.duration_hours * 60
+            )
+        )
+    )
 
 
 def _activity_capacity_for_archetype(
@@ -264,7 +434,13 @@ def _activity_from_record(
     record: Mapping[str, Any],
 ) -> ActivityProfile:
     engine = ActivityConstraintsEngine()
+
     return engine.normalize(record)
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
 
 
 def _scheduled_from_record(
@@ -276,13 +452,19 @@ def _scheduled_from_record(
 
     activity = (
         _activity_from_record(activity_record)
-        if isinstance(activity_record, Mapping)
+        if isinstance(
+            activity_record,
+            Mapping,
+        )
         else _activity_from_record(record)
     )
 
-    start = _parse_time(
-        record.get("start_minutes") or record.get("start_time")
-    )
+    start_value = record.get("start_minutes")
+
+    if start_value is None:
+        start_value = record.get("start_time")
+
+    start = _parse_time(start_value)
 
     if start is None:
         start = activity.fixed_start_minutes
@@ -290,16 +472,25 @@ def _scheduled_from_record(
     if start is None:
         start = DEFAULT_DAY_START_MINUTES
 
-    end = _parse_time(
-        record.get("end_minutes") or record.get("end_time")
-    )
+    end_value = record.get("end_minutes")
+
+    if end_value is None:
+        end_value = record.get("end_time")
+
+    end = _parse_time(end_value)
 
     if end is None:
-        end = _activity_end(activity, start)
+        end = _activity_end(
+            activity,
+            start,
+        )
 
-    fixed = _safe_bool(
-        record.get("fixed") or record.get("fixed_time")
-    )
+    fixed_value = record.get("fixed")
+
+    if fixed_value is None:
+        fixed_value = record.get("fixed_time")
+
+    fixed = _safe_bool(fixed_value)
 
     if activity.fixed_start_minutes is not None:
         fixed = True
@@ -309,6 +500,24 @@ def _scheduled_from_record(
         50,
     )
 
+    travel_before = record.get(
+        "travel_before_minutes"
+    )
+
+    if travel_before is None:
+        travel_before = record.get(
+            "transfer_before_minutes"
+        )
+
+    travel_after = record.get(
+        "travel_after_minutes"
+    )
+
+    if travel_after is None:
+        travel_after = record.get(
+            "transfer_after_minutes"
+        )
+
     return ScheduledActivity(
         activity=activity,
         start_minutes=start,
@@ -317,12 +526,10 @@ def _scheduled_from_record(
         fixed=fixed,
         priority=priority,
         travel_before_minutes=_safe_int(
-            record.get("travel_before_minutes")
-            or record.get("transfer_before_minutes")
+            travel_before
         ),
         travel_after_minutes=_safe_int(
-            record.get("travel_after_minutes")
-            or record.get("transfer_after_minutes")
+            travel_after
         ),
         raw=dict(record),
     )
@@ -333,14 +540,23 @@ def parse_schedule(
 ) -> list[list[ScheduledActivity]]:
     result: list[list[ScheduledActivity]] = []
 
-    for day_index, day in enumerate(days, start=1):
+    for day_index, day in enumerate(
+        days,
+        start=1,
+    ):
         raw_activities = (
             day.get("activities")
             or day.get("schedule")
             or []
         )
 
-        if not isinstance(raw_activities, Sequence):
+        if not isinstance(
+            raw_activities,
+            Sequence,
+        ) or isinstance(
+            raw_activities,
+            (str, bytes),
+        ):
             raw_activities = []
 
         parsed = [
@@ -349,13 +565,16 @@ def parse_schedule(
                 day_number=day_index,
             )
             for activity in raw_activities
-            if isinstance(activity, Mapping)
+            if isinstance(
+                activity,
+                Mapping,
+            )
         ]
 
         parsed.sort(
             key=lambda item: (
                 item.start_minutes,
-                item.fixed is False,
+                not item.fixed,
                 -item.priority,
             )
         )
@@ -363,6 +582,11 @@ def parse_schedule(
         result.append(parsed)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Validator
+# ---------------------------------------------------------------------------
 
 
 class ScheduleValidator:
@@ -377,10 +601,16 @@ class ScheduleValidator:
 
         ordered = sorted(
             activities,
-            key=lambda item: item.start_minutes,
+            key=lambda item: (
+                item.start_minutes,
+                not item.fixed,
+                -item.priority,
+            ),
         )
 
-        capacity = _activity_capacity_for_archetype(archetype)
+        capacity = _activity_capacity_for_archetype(
+            archetype
+        )
 
         total_hours = sum(
             item.activity.duration_hours
@@ -435,7 +665,9 @@ class ScheduleValidator:
 
         for activity in ordered:
             conflicts.extend(
-                self.validate_activity(activity)
+                self.validate_activity(
+                    activity
+                )
             )
 
         for first, second in zip(
@@ -454,17 +686,26 @@ class ScheduleValidator:
                 - second.travel_before_minutes
             )
 
-            if second_start < first_end + MIN_ACTIVITY_GAP_MINUTES:
+            if (
+                second_start
+                < first_end
+                + MIN_ACTIVITY_GAP_MINUTES
+            ):
                 conflicts.append(
                     ScheduleConflict(
                         conflict_type=ConflictType.OVERLAP,
                         day_number=day_number,
-                        activity_id=second.activity.activity_id,
-                        related_activity_id=first.activity.activity_id,
+                        activity_id=(
+                            second.activity.activity_id
+                        ),
+                        related_activity_id=(
+                            first.activity.activity_id
+                        ),
                         severity="hard",
                         message=(
                             f"{second.activity.name} overlaps or has "
-                            f"insufficient buffer after {first.activity.name}."
+                            f"insufficient buffer after "
+                            f"{first.activity.name}."
                         ),
                     )
                 )
@@ -479,7 +720,10 @@ class ScheduleValidator:
         day = scheduled.day_number
         conflicts: list[ScheduleConflict] = []
 
-        if scheduled.end_minutes <= scheduled.start_minutes:
+        if (
+            scheduled.end_minutes
+            <= scheduled.start_minutes
+        ):
             conflicts.append(
                 ScheduleConflict(
                     conflict_type=ConflictType.INVALID_DURATION,
@@ -487,10 +731,12 @@ class ScheduleValidator:
                     activity_id=activity.activity_id,
                     severity="hard",
                     message=(
-                        f"{activity.name} has an invalid scheduled duration."
+                        f"{activity.name} has an invalid "
+                        f"scheduled duration."
                     ),
                 )
             )
+
             return conflicts
 
         if (
@@ -505,7 +751,8 @@ class ScheduleValidator:
                     activity_id=activity.activity_id,
                     severity="hard",
                     message=(
-                        f"{activity.name} is not scheduled at its fixed start."
+                        f"{activity.name} is not scheduled "
+                        f"at its fixed start."
                     ),
                 )
             )
@@ -522,7 +769,8 @@ class ScheduleValidator:
                     activity_id=activity.activity_id,
                     severity="hard",
                     message=(
-                        f"{activity.name} starts before its allowed window."
+                        f"{activity.name} starts before "
+                        f"its allowed window."
                     ),
                 )
             )
@@ -539,7 +787,8 @@ class ScheduleValidator:
                     activity_id=activity.activity_id,
                     severity="hard",
                     message=(
-                        f"{activity.name} starts after its latest allowed start."
+                        f"{activity.name} starts after "
+                        f"its latest allowed start."
                     ),
                 )
             )
@@ -556,7 +805,8 @@ class ScheduleValidator:
                     activity_id=activity.activity_id,
                     severity="hard",
                     message=(
-                        f"{activity.name} finishes after its latest allowed time."
+                        f"{activity.name} finishes after "
+                        f"its latest allowed time."
                     ),
                 )
             )
@@ -579,7 +829,14 @@ class ScheduleValidator:
                 )
             )
 
-        if scheduled.start_minutes < DEFAULT_DAY_START_MINUTES:
+        # A factual fixed-time activity may legitimately begin before
+        # the normal 07:00 itinerary window. This is important for
+        # 06:00 game drives.
+        if (
+            not scheduled.fixed
+            and scheduled.start_minutes
+            < DEFAULT_DAY_START_MINUTES
+        ):
             conflicts.append(
                 ScheduleConflict(
                     conflict_type=ConflictType.TOO_EARLY,
@@ -593,7 +850,12 @@ class ScheduleValidator:
                 )
             )
 
-        if scheduled.end_minutes > DEFAULT_DAY_END_MINUTES:
+        # Do not automatically call a fixed activity invalid merely
+        # because it extends the normal soft day boundary.
+        if (
+            scheduled.end_minutes
+            > DEFAULT_DAY_END_MINUTES
+        ):
             conflicts.append(
                 ScheduleConflict(
                     conflict_type=ConflictType.TOO_LATE,
@@ -611,9 +873,15 @@ class ScheduleValidator:
 
     def validate(
         self,
-        schedule: Sequence[Sequence[ScheduledActivity]],
+        schedule: Sequence[
+            Sequence[ScheduledActivity]
+        ],
         *,
-        archetypes: Mapping[int, DayArchetype] | None = None,
+        archetypes: Mapping[
+            int,
+            DayArchetype,
+        ]
+        | None = None,
     ) -> list[ScheduleConflict]:
         conflicts: list[ScheduleConflict] = []
 
@@ -638,12 +906,112 @@ class ScheduleValidator:
         return conflicts
 
 
+# ---------------------------------------------------------------------------
+# Repair engine
+# ---------------------------------------------------------------------------
+
+
 class ScheduleRepairEngine:
     name = "ScheduleRepairEngine"
-    version = "1.0"
+    version = "2.0"
 
     def __init__(self) -> None:
         self.validator = ScheduleValidator()
+
+    # ------------------------------------------------------------------
+    # Activity semantic helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_non_movable(
+        activity: ScheduledActivity,
+    ) -> bool:
+        if activity.fixed:
+            return True
+
+        if activity.activity.fixed_start_minutes is not None:
+            return True
+
+        if activity.is_transfer_activity:
+            return True
+
+        return False
+
+    @staticmethod
+    def _day_destination_id(
+        day: Mapping[str, Any],
+    ) -> str | None:
+        """
+        Extract the authoritative destination identity for a calendar day.
+
+        Planner-generated days should provide destination_id directly.
+        """
+
+        value = day.get("destination_id")
+
+        if value is None:
+            destination = day.get("destination")
+
+            if isinstance(
+                destination,
+                Mapping,
+            ):
+                value = (
+                    destination.get("id")
+                    or destination.get("destination_id")
+                )
+
+        if value is None:
+            return None
+
+        text = str(value).strip()
+
+        return text or None
+
+    @staticmethod
+    def _day_destination_ids_from_input(
+        days: Sequence[Mapping[str, Any]],
+    ) -> dict[int, str | None]:
+        return {
+            day_number: ScheduleRepairEngine._day_destination_id(
+                day
+            )
+            for day_number, day in enumerate(
+                days,
+                start=1,
+            )
+        }
+
+    @staticmethod
+    def _same_destination(
+        activity: ScheduledActivity,
+        target_destination_id: str | None,
+    ) -> bool:
+        """
+        Cross-day movement is allowed only when both sides identify the
+        same destination.
+
+        Unknown destination identity is NOT treated as equal.
+        This deliberately prevents unsafe historical records from being
+        silently moved between destinations.
+        """
+
+        activity_destination = activity.destination_id
+
+        if (
+            activity_destination is None
+            or target_destination_id is None
+        ):
+            return False
+
+        return (
+            activity_destination
+            == target_destination_id
+        )
+
+    # ------------------------------------------------------------------
+    # Time placement
+    # ------------------------------------------------------------------
 
     def _earliest_legal_start(
         self,
@@ -655,19 +1023,25 @@ class ScheduleRepairEngine:
         travel_after_minutes: int = 0,
     ) -> int | None:
         """
-        Find the earliest legal start for an ActivityProfile.
+        Find the earliest legal start without changing activity identity.
 
-        IMPORTANT:
-        travel_before_minutes and travel_after_minutes belong to the
-        ScheduledActivity wrapper, not ActivityProfile. They are therefore
-        passed explicitly into this method.
+        This method considers:
+        - activity preparation
+        - activity recovery
+        - travel before/after
+        - minimum gap
+        - opening windows
+        - earliest/latest start
+        - latest finish
+        - existing scheduled activities
         """
 
         candidate = max(
             preferred_start,
             (
                 activity.earliest_start_minutes
-                if activity.earliest_start_minutes is not None
+                if activity.earliest_start_minutes
+                is not None
                 else DEFAULT_DAY_START_MINUTES
             ),
         )
@@ -680,21 +1054,27 @@ class ScheduleRepairEngine:
         if candidate is None:
             return None
 
-        for _ in range(100):
+        for _ in range(
+            MAX_SEARCH_ITERATIONS
+        ):
             end = _activity_end(
                 activity,
                 candidate,
             )
 
             if (
-                activity.latest_start_minutes is not None
-                and candidate > activity.latest_start_minutes
+                activity.latest_start_minutes
+                is not None
+                and candidate
+                > activity.latest_start_minutes
             ):
                 return None
 
             if (
-                activity.latest_finish_minutes is not None
-                and end > activity.latest_finish_minutes
+                activity.latest_finish_minutes
+                is not None
+                and end
+                > activity.latest_finish_minutes
             ):
                 return None
 
@@ -703,23 +1083,68 @@ class ScheduleRepairEngine:
                 candidate,
                 end,
             ):
-                candidate = _next_window_start(
+                next_start = _next_window_start(
                     activity.opening_windows,
                     candidate + 1,
                 )
 
-                if candidate is None:
+                if next_start is None:
                     return None
 
+                candidate = next_start
                 continue
 
-            conflict_found = False
+            moved = False
 
-            for other in sorted(
+            ordered = sorted(
                 existing,
-                key=lambda item: item.start_minutes,
-            ):
-                required_start = (
+                key=lambda item: (
+                    item.start_minutes,
+                    item.end_minutes,
+                ),
+            )
+
+            for other in ordered:
+                candidate_occupied_start = (
+                    candidate
+                    - activity.preparation_minutes
+                    - travel_before_minutes
+                )
+
+                candidate_occupied_end = (
+                    end
+                    + activity.recovery_minutes
+                    + travel_after_minutes
+                )
+
+                other_occupied_start = (
+                    other.start_minutes
+                    - other.activity.preparation_minutes
+                    - other.travel_before_minutes
+                )
+
+                other_occupied_end = (
+                    other.end_minutes
+                    + other.activity.recovery_minutes
+                    + other.travel_after_minutes
+                )
+
+                if (
+                    candidate_occupied_end
+                    + MIN_ACTIVITY_GAP_MINUTES
+                    <= other_occupied_start
+                ):
+                    continue
+
+                if (
+                    other_occupied_end
+                    + MIN_ACTIVITY_GAP_MINUTES
+                    <= candidate_occupied_start
+                ):
+                    continue
+
+                # Conflict. Push the candidate after this activity.
+                candidate = (
                     other.end_minutes
                     + other.activity.recovery_minutes
                     + other.travel_after_minutes
@@ -728,52 +1153,73 @@ class ScheduleRepairEngine:
                     + MIN_ACTIVITY_GAP_MINUTES
                 )
 
-                if candidate < required_start:
-                    candidate = required_start
-                    conflict_found = True
-                    break
-
-                candidate_end = end
-
-                required_other_start = (
-                    candidate_end
-                    + activity.recovery_minutes
-                    + travel_after_minutes
-                    + other.activity.preparation_minutes
-                    + other.travel_before_minutes
-                    + MIN_ACTIVITY_GAP_MINUTES
+                next_start = _next_window_start(
+                    activity.opening_windows,
+                    candidate,
                 )
 
-                if required_other_start > other.start_minutes:
-                    candidate = (
-                        other.end_minutes
-                        + other.activity.recovery_minutes
-                        + other.travel_after_minutes
-                        + activity.preparation_minutes
-                        + travel_before_minutes
-                        + MIN_ACTIVITY_GAP_MINUTES
-                    )
+                if next_start is None:
+                    return None
 
-                    conflict_found = True
-                    break
+                candidate = next_start
+                moved = True
+                break
 
-            if conflict_found:
+            if moved:
                 continue
 
             return candidate
 
         return None
 
+    # ------------------------------------------------------------------
+    # Cross-day candidates
+    # ------------------------------------------------------------------
+
     def _candidate_days(
         self,
         activity: ScheduledActivity,
-        schedule: Sequence[Sequence[ScheduledActivity]],
-        archetypes: Mapping[int, DayArchetype] | None,
+        schedule: Sequence[
+            Sequence[ScheduledActivity]
+        ],
+        archetypes: Mapping[
+            int,
+            DayArchetype,
+        ]
+        | None,
+        *,
+        day_destinations: Mapping[
+            int,
+            str | None,
+        ]
+        | None = None,
     ) -> list[int]:
+        """
+        Return only semantically safe target days.
+
+        IMPORTANT:
+        A flexible activity may only move to another day belonging to the
+        SAME destination.
+
+        If destination identity is unavailable, cross-day repair is disabled.
+        """
+
+        if self._is_non_movable(activity):
+            return []
+
         current_day = activity.day_number
 
+        if (
+            day_destinations is None
+            or activity.destination_id is None
+        ):
+            return []
+
         candidates = list(
-            range(1, len(schedule) + 1)
+            range(
+                1,
+                len(schedule) + 1,
+            )
         )
 
         candidates.sort(
@@ -789,43 +1235,100 @@ class ScheduleRepairEngine:
             if day == current_day:
                 continue
 
+            target_destination_id = (
+                day_destinations.get(day)
+            )
+
+            if not self._same_destination(
+                activity,
+                target_destination_id,
+            ):
+                continue
+
             archetype = (
                 archetypes.get(day)
                 if archetypes
                 else None
             )
 
-            if archetype in {
+            blocked_archetypes = {
                 DayArchetype.DEPARTURE,
                 DayArchetype.ARRIVAL,
+                DayArchetype.TRANSFER,
                 DayArchetype.LONG_TRANSFER,
-            }:
+                DayArchetype.RECOVERY,
+            }
+
+            overnight_transition = getattr(
+                DayArchetype,
+                "OVERNIGHT_TRANSITION",
+                None,
+            )
+
+            if overnight_transition is not None:
+                blocked_archetypes.add(
+                    overnight_transition
+                )
+
+            if archetype in blocked_archetypes:
                 continue
 
             result.append(day)
 
         return result
 
+    # ------------------------------------------------------------------
+    # Cross-day movement
+    # ------------------------------------------------------------------
+
     def _move_activity(
         self,
-        schedule: list[list[ScheduledActivity]],
+        schedule: list[
+            list[ScheduledActivity]
+        ],
         activity: ScheduledActivity,
         *,
         to_day: int,
-        archetypes: Mapping[int, DayArchetype] | None,
+        archetypes: Mapping[
+            int,
+            DayArchetype,
+        ]
+        | None,
+        day_destinations: Mapping[
+            int,
+            str | None,
+        ]
+        | None = None,
     ) -> RepairAction | None:
-        if activity.fixed:
+        """
+        Move an activity only when destination semantics remain identical.
+
+        Route-transfer activities are never moved.
+        """
+
+        if self._is_non_movable(activity):
             return None
 
-        if activity.activity.fixed_start_minutes is not None:
+        if (
+            day_destinations is None
+            or not self._same_destination(
+                activity,
+                day_destinations.get(to_day),
+            )
+        ):
             return None
 
         destination_index = to_day - 1
 
-        if not 0 <= destination_index < len(schedule):
+        if not (
+            0 <= destination_index
+            < len(schedule)
+        ):
             return None
 
-        destination_day = schedule[destination_index]
+        destination_day = schedule[
+            destination_index
+        ]
 
         archetype = (
             archetypes.get(to_day)
@@ -858,8 +1361,12 @@ class ScheduleRepairEngine:
             activity.activity,
             destination_day,
             preferred_start=preferred_start,
-            travel_before_minutes=activity.travel_before_minutes,
-            travel_after_minutes=activity.travel_after_minutes,
+            travel_before_minutes=(
+                activity.travel_before_minutes
+            ),
+            travel_after_minutes=(
+                activity.travel_after_minutes
+            ),
         )
 
         if start is None:
@@ -870,6 +1377,12 @@ class ScheduleRepairEngine:
             start,
         )
 
+        if (
+            not activity.fixed
+            and end > DEFAULT_DAY_END_MINUTES
+        ):
+            return None
+
         repaired = replace(
             activity,
             start_minutes=start,
@@ -877,59 +1390,99 @@ class ScheduleRepairEngine:
             day_number=to_day,
         )
 
-        schedule[
-            activity.day_number - 1
-        ].remove(activity)
+        source_index = activity.day_number - 1
 
-        destination_day.append(repaired)
+        if not (
+            0 <= source_index
+            < len(schedule)
+        ):
+            return None
+
+        try:
+            schedule[source_index].remove(
+                activity
+            )
+        except ValueError:
+            return None
+
+        destination_day.append(
+            repaired
+        )
 
         destination_day.sort(
             key=lambda item: (
                 item.start_minutes,
-                item.fixed is False,
+                not item.fixed,
                 -item.priority,
             )
         )
 
         return RepairAction(
             action_type=RepairActionType.MOVE,
-            activity_id=activity.activity.activity_id,
+            activity_id=(
+                activity.activity.activity_id
+            ),
             from_day=activity.day_number,
             to_day=to_day,
-            from_start_minutes=activity.start_minutes,
+            from_start_minutes=(
+                activity.start_minutes
+            ),
             to_start_minutes=start,
             reason=(
-                "Moved flexible activity to reduce "
-                "schedule conflict."
+                "Moved flexible activity to another "
+                "calendar day within the same destination "
+                "to reduce a schedule conflict."
             ),
-            confidence=0.92,
+            confidence=0.94,
         )
+
+    # ------------------------------------------------------------------
+    # Same-day shifting
+    # ------------------------------------------------------------------
 
     def _shift_activity(
         self,
-        schedule: list[list[ScheduledActivity]],
+        schedule: list[
+            list[ScheduledActivity]
+        ],
         activity: ScheduledActivity,
     ) -> RepairAction | None:
-        if activity.fixed:
+        """
+        Shift an activity within its existing day.
+
+        This is the preferred repair mechanism because it cannot alter
+        destination sequence.
+        """
+
+        if self._is_non_movable(activity):
             return None
 
-        day = schedule[
-            activity.day_number - 1
-        ]
+        day_index = activity.day_number - 1
+
+        if not (
+            0 <= day_index
+            < len(schedule)
+        ):
+            return None
+
+        day = schedule[day_index]
 
         others = [
             item
             for item in day
-            if item.activity.activity_id
-            != activity.activity.activity_id
+            if item is not activity
         ]
 
         start = self._earliest_legal_start(
             activity.activity,
             others,
             preferred_start=activity.start_minutes,
-            travel_before_minutes=activity.travel_before_minutes,
-            travel_after_minutes=activity.travel_after_minutes,
+            travel_before_minutes=(
+                activity.travel_before_minutes
+            ),
+            travel_after_minutes=(
+                activity.travel_after_minutes
+            ),
         )
 
         if (
@@ -943,6 +1496,11 @@ class ScheduleRepairEngine:
             start,
         )
 
+        # Never push a normal flexible activity beyond the normal
+        # itinerary boundary merely to claim it was repaired.
+        if end > DEFAULT_DAY_END_MINUTES:
+            return None
+
         index = day.index(activity)
 
         day[index] = replace(
@@ -954,7 +1512,7 @@ class ScheduleRepairEngine:
         day.sort(
             key=lambda item: (
                 item.start_minutes,
-                item.fixed is False,
+                not item.fixed,
                 -item.priority,
             )
         )
@@ -967,26 +1525,76 @@ class ScheduleRepairEngine:
 
         return RepairAction(
             action_type=action_type,
-            activity_id=activity.activity.activity_id,
+            activity_id=(
+                activity.activity.activity_id
+            ),
             from_day=activity.day_number,
             to_day=activity.day_number,
-            from_start_minutes=activity.start_minutes,
+            from_start_minutes=(
+                activity.start_minutes
+            ),
             to_start_minutes=start,
             reason=(
-                "Shifted flexible activity to a legal time window."
+                "Shifted flexible activity within the "
+                "same destination day to a legal time window."
             ),
-            confidence=0.95,
+            confidence=0.96,
         )
+
+    # ------------------------------------------------------------------
+    # Conflict handling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _repairable_conflict(
+        conflict: ScheduleConflict,
+    ) -> bool:
+        return conflict.conflict_type in {
+            ConflictType.OVERLAP,
+            ConflictType.OUTSIDE_OPENING_HOURS,
+            ConflictType.TOO_EARLY,
+            ConflictType.TOO_LATE,
+            ConflictType.LATEST_FINISH,
+        }
+
+    # ------------------------------------------------------------------
+    # Main repair
+    # ------------------------------------------------------------------
 
     def repair(
         self,
-        days: Sequence[Mapping[str, Any]],
+        days: Sequence[
+            Mapping[str, Any]
+        ],
         *,
-        archetypes: Mapping[int, DayArchetype] | None = None,
+        archetypes: Mapping[
+            int,
+            DayArchetype,
+        ]
+        | None = None,
     ) -> ScheduleRepairResult:
+        """
+        Validate and conservatively repair an itinerary schedule.
+
+        The engine does NOT:
+        - invent activities,
+        - invent transport,
+        - change destination order,
+        - move activities between different destinations,
+        - move route transfers,
+        - move fixed-time activities,
+        - fabricate missing destination identity.
+        """
+
         schedule = parse_schedule(days)
 
-        all_conflicts = self.validator.validate(
+        day_destinations = (
+            self._day_destination_ids_from_input(
+                days
+            )
+        )
+
+        initial_conflicts = self.validator.validate(
             schedule,
             archetypes=archetypes,
         )
@@ -994,7 +1602,10 @@ class ScheduleRepairEngine:
         actions: list[RepairAction] = []
         iterations = 0
 
-        while iterations < MAX_REPAIR_ITERATIONS:
+        while (
+            iterations
+            < MAX_REPAIR_ITERATIONS
+        ):
             iterations += 1
 
             conflicts = self.validator.validate(
@@ -1007,14 +1618,15 @@ class ScheduleRepairEngine:
 
             progress = False
 
+            # ----------------------------------------------------------
+            # Phase 1:
+            # Repair conflicts inside the same day.
+            # ----------------------------------------------------------
+
             for conflict in conflicts:
-                if conflict.conflict_type not in {
-                    ConflictType.OVERLAP,
-                    ConflictType.OUTSIDE_OPENING_HOURS,
-                    ConflictType.TOO_EARLY,
-                    ConflictType.TOO_LATE,
-                    ConflictType.LATEST_FINISH,
-                }:
+                if not self._repairable_conflict(
+                    conflict
+                ):
                     continue
 
                 activity = self._find_activity(
@@ -1022,7 +1634,12 @@ class ScheduleRepairEngine:
                     conflict.activity_id,
                 )
 
-                if activity is None or activity.fixed:
+                if activity is None:
+                    continue
+
+                if self._is_non_movable(
+                    activity
+                ):
                     continue
 
                 action = self._shift_activity(
@@ -1030,7 +1647,7 @@ class ScheduleRepairEngine:
                     activity,
                 )
 
-                if action:
+                if action is not None:
                     actions.append(action)
                     progress = True
                     break
@@ -1038,28 +1655,50 @@ class ScheduleRepairEngine:
             if progress:
                 continue
 
+            # ----------------------------------------------------------
+            # Phase 2:
+            # Cross-day repair is deliberately conservative.
+            #
+            # Only same-destination activities may move.
+            # Transfer activities and fixed activities are excluded.
+            # ----------------------------------------------------------
+
             for conflict in conflicts:
+                if not self._repairable_conflict(
+                    conflict
+                ):
+                    continue
+
                 activity = self._find_activity(
                     schedule,
                     conflict.activity_id,
                 )
 
-                if activity is None or activity.fixed:
+                if activity is None:
                     continue
 
-                for target_day in self._candidate_days(
+                if self._is_non_movable(
+                    activity
+                ):
+                    continue
+
+                candidates = self._candidate_days(
                     activity,
                     schedule,
                     archetypes,
-                ):
+                    day_destinations=day_destinations,
+                )
+
+                for target_day in candidates:
                     action = self._move_activity(
                         schedule,
                         activity,
                         to_day=target_day,
                         archetypes=archetypes,
+                        day_destinations=day_destinations,
                     )
 
-                    if action:
+                    if action is not None:
                         actions.append(action)
                         progress = True
                         break
@@ -1069,6 +1708,12 @@ class ScheduleRepairEngine:
 
             if progress:
                 continue
+
+            # ----------------------------------------------------------
+            # No safe deterministic repair exists.
+            #
+            # Stop instead of making an unsafe mutation.
+            # ----------------------------------------------------------
 
             break
 
@@ -1084,7 +1729,8 @@ class ScheduleRepairEngine:
         if remaining:
             warnings.append(
                 "One or more schedule conflicts could not "
-                "be repaired automatically."
+                "be repaired automatically without risking "
+                "destination, route, or fixed-time integrity."
             )
 
         for conflict in remaining:
@@ -1099,9 +1745,15 @@ class ScheduleRepairEngine:
         )
 
         return ScheduleRepairResult(
-            days=tuple(repaired_days),
-            conflicts_found=tuple(all_conflicts),
-            conflicts_remaining=tuple(remaining),
+            days=tuple(
+                repaired_days
+            ),
+            conflicts_found=tuple(
+                initial_conflicts
+            ),
+            conflicts_remaining=tuple(
+                remaining
+            ),
             actions=tuple(actions),
             repaired=repaired,
             fully_repaired=not remaining,
@@ -1109,9 +1761,15 @@ class ScheduleRepairEngine:
             iterations=iterations,
         )
 
+    # ------------------------------------------------------------------
+    # Lookup
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _find_activity(
-        schedule: Sequence[Sequence[ScheduledActivity]],
+        schedule: Sequence[
+            Sequence[ScheduledActivity]
+        ],
         activity_id: str,
     ) -> ScheduledActivity | None:
         for day in schedule:
@@ -1124,11 +1782,21 @@ class ScheduleRepairEngine:
 
         return None
 
+    # ------------------------------------------------------------------
+    # Result construction
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _build_repaired_days(
-        schedule: Sequence[Sequence[ScheduledActivity]],
+        schedule: Sequence[
+            Sequence[ScheduledActivity]
+        ],
         *,
-        archetypes: Mapping[int, DayArchetype] | None,
+        archetypes: Mapping[
+            int,
+            DayArchetype,
+        ]
+        | None,
     ) -> list[RepairedDay]:
         result: list[RepairedDay] = []
 
@@ -1140,7 +1808,7 @@ class ScheduleRepairEngine:
                 activities,
                 key=lambda item: (
                     item.start_minutes,
-                    item.fixed is False,
+                    not item.fixed,
                     -item.priority,
                 ),
             )
@@ -1166,12 +1834,15 @@ class ScheduleRepairEngine:
                 }
             )
 
-            capacity = _activity_capacity_for_archetype(
-                archetype
+            capacity = (
+                _activity_capacity_for_archetype(
+                    archetype
+                )
             )
 
             overloaded = (
-                total_activity_hours > capacity
+                total_activity_hours
+                > capacity
                 or total_intense_hours
                 > INTENSE_DAY_MAX_ACTIVITY_HOURS
             )
@@ -1186,7 +1857,9 @@ class ScheduleRepairEngine:
             result.append(
                 RepairedDay(
                     day_number=day_number,
-                    activities=tuple(ordered),
+                    activities=tuple(
+                        ordered
+                    ),
                     archetype=archetype,
                     total_activity_hours=round(
                         total_activity_hours,
@@ -1197,17 +1870,29 @@ class ScheduleRepairEngine:
                         2,
                     ),
                     overloaded=overloaded,
-                    warnings=tuple(warnings),
+                    warnings=tuple(
+                        warnings
+                    ),
                 )
             )
 
         return result
 
+    # ------------------------------------------------------------------
+    # Public compatibility methods
+    # ------------------------------------------------------------------
+
     def repair_schedule(
         self,
-        days: Sequence[Mapping[str, Any]],
+        days: Sequence[
+            Mapping[str, Any]
+        ],
         *,
-        archetypes: Mapping[int, DayArchetype] | None = None,
+        archetypes: Mapping[
+            int,
+            DayArchetype,
+        ]
+        | None = None,
     ) -> ScheduleRepairResult:
         return self.repair(
             days,
@@ -1216,9 +1901,15 @@ class ScheduleRepairEngine:
 
     def validate(
         self,
-        days: Sequence[Mapping[str, Any]],
+        days: Sequence[
+            Mapping[str, Any]
+        ],
         *,
-        archetypes: Mapping[int, DayArchetype] | None = None,
+        archetypes: Mapping[
+            int,
+            DayArchetype,
+        ]
+        | None = None,
     ) -> tuple[ScheduleConflict, ...]:
         schedule = parse_schedule(days)
 
@@ -1230,15 +1921,27 @@ class ScheduleRepairEngine:
         )
 
 
-def _format_minutes(minutes: int) -> str:
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+# ---------------------------------------------------------------------------
+# Serialization
+# ---------------------------------------------------------------------------
+
+
+def _format_minutes(
+    minutes: int,
+) -> str:
+    return (
+        f"{minutes // 60:02d}:"
+        f"{minutes % 60:02d}"
+    )
 
 
 def scheduled_activity_to_dict(
     activity: ScheduledActivity,
 ) -> dict[str, Any]:
-    return {
-        "activity_id": activity.activity.activity_id,
+    result: dict[str, Any] = {
+        "activity_id": (
+            activity.activity.activity_id
+        ),
         "name": activity.activity.name,
         "day_number": activity.day_number,
         "start_time": _format_minutes(
@@ -1249,13 +1952,28 @@ def scheduled_activity_to_dict(
         ),
         "start_minutes": activity.start_minutes,
         "end_minutes": activity.end_minutes,
-        "duration_hours": activity.activity.duration_hours,
+        "duration_hours": (
+            activity.activity.duration_hours
+        ),
         "fixed": activity.fixed,
         "priority": activity.priority,
-        "travel_before_minutes": activity.travel_before_minutes,
-        "travel_after_minutes": activity.travel_after_minutes,
-        "intensity": activity.activity.intensity.value,
+        "travel_before_minutes": (
+            activity.travel_before_minutes
+        ),
+        "travel_after_minutes": (
+            activity.travel_after_minutes
+        ),
+        "intensity": (
+            activity.activity.intensity.value
+        ),
     }
+
+    if activity.destination_id is not None:
+        result["destination_id"] = (
+            activity.destination_id
+        )
+
+    return result
 
 
 def schedule_repair_result_to_dict(
@@ -1273,62 +1991,86 @@ def schedule_repair_result_to_dict(
                     else None
                 ),
                 "activities": [
-                    scheduled_activity_to_dict(a)
-                    for a in day.activities
+                    scheduled_activity_to_dict(
+                        activity
+                    )
+                    for activity in day.activities
                 ],
-                "total_activity_hours": day.total_activity_hours,
-                "total_intense_hours": day.total_intense_hours,
+                "total_activity_hours": (
+                    day.total_activity_hours
+                ),
+                "total_intense_hours": (
+                    day.total_intense_hours
+                ),
                 "overloaded": day.overloaded,
-                "warnings": list(day.warnings),
+                "warnings": list(
+                    day.warnings
+                ),
             }
             for day in result.days
         ],
         "conflicts_found": [
             {
-                "type": c.conflict_type.value,
-                "day_number": c.day_number,
-                "activity_id": c.activity_id,
-                "related_activity_id": c.related_activity_id,
-                "severity": c.severity,
-                "message": c.message,
+                "type": conflict.conflict_type.value,
+                "day_number": conflict.day_number,
+                "activity_id": conflict.activity_id,
+                "related_activity_id": (
+                    conflict.related_activity_id
+                ),
+                "severity": conflict.severity,
+                "message": conflict.message,
             }
-            for c in result.conflicts_found
+            for conflict in result.conflicts_found
         ],
         "conflicts_remaining": [
             {
-                "type": c.conflict_type.value,
-                "day_number": c.day_number,
-                "activity_id": c.activity_id,
-                "related_activity_id": c.related_activity_id,
-                "severity": c.severity,
-                "message": c.message,
+                "type": conflict.conflict_type.value,
+                "day_number": conflict.day_number,
+                "activity_id": conflict.activity_id,
+                "related_activity_id": (
+                    conflict.related_activity_id
+                ),
+                "severity": conflict.severity,
+                "message": conflict.message,
             }
-            for c in result.conflicts_remaining
+            for conflict in result.conflicts_remaining
         ],
         "actions": [
             {
-                "type": a.action_type.value,
-                "activity_id": a.activity_id,
-                "from_day": a.from_day,
-                "to_day": a.to_day,
-                "from_start_minutes": a.from_start_minutes,
-                "to_start_minutes": a.to_start_minutes,
-                "reason": a.reason,
-                "confidence": a.confidence,
+                "type": action.action_type.value,
+                "activity_id": action.activity_id,
+                "from_day": action.from_day,
+                "to_day": action.to_day,
+                "from_start_minutes": (
+                    action.from_start_minutes
+                ),
+                "to_start_minutes": (
+                    action.to_start_minutes
+                ),
+                "reason": action.reason,
+                "confidence": action.confidence,
             }
-            for a in result.actions
+            for action in result.actions
         ],
         "repaired": result.repaired,
         "fully_repaired": result.fully_repaired,
-        "warnings": list(result.warnings),
+        "warnings": list(
+            result.warnings
+        ),
         "iterations": result.iterations,
     }
 
 
 def repair_schedule(
-    days: Sequence[Mapping[str, Any]],
+    days: Sequence[
+        Mapping[str, Any]
+    ],
     *,
-    archetypes: Mapping[int, DayArchetype] | None = None,
+    archetypes: Mapping[
+        int,
+        DayArchetype,
+    ]
+    | None = None,
 ) -> ScheduleRepairResult:
     return ScheduleRepairEngine().repair(
         days,
@@ -1351,4 +2093,3 @@ __all__ = [
     "schedule_repair_result_to_dict",
     "repair_schedule",
 ]
-
