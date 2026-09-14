@@ -522,14 +522,18 @@ class ItineraryOrchestrator:
         # 12. TRANSIT CLASSIFICATION
         # ==============================================================
 
+        # IMPORTANT:
+        #
+        # transit_days_from_day_plan() returns the transit-day mapping
+        # expected by ItineraryPlanningEngine.build().
+        #
+        # Do NOT convert this to a set. build() accesses transit_days
+        # using .get(...), so preserving the mapping contract is
+        # required.
         transit_days = transit_days_from_day_plan(
             pre_planning_day_plan,
             day_records=day_records,
-        )
-
-        transit_days = set(
-            transit_days or []
-        )
+        ) or {}
 
         # ==============================================================
         # 13. BUILD CABINET
