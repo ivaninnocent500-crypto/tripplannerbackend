@@ -112,11 +112,10 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(name)
 
-============================================================================
 
 CONSTANTS
 
-============================================================================
+
 
 DRIVE_TO_FLIGHT_COMPARISON_MINUTES = 6 * 60
 
@@ -127,11 +126,10 @@ LONG_TRANSFER_WARNING_MINUTES = 4 * 60
 EARTH_RADIUS_KM = 6371.0088
 ASSUMED_ROAD_SPEED_KMH = 45.0
 
-============================================================================
+
 
 DATA CLASSES
 
-============================================================================
 
 @dataclass(frozen=True)
 class GeoPoint:
@@ -313,11 +311,10 @@ def total_known_duration_minutes(self) -> int:
         if leg.duration_minutes is not None
     )
 
-============================================================================
+
 
 EXCEPTIONS
 
-============================================================================
 
 class RouteGeographyError(Exception):
 """Base exception for route-geography failures."""
@@ -325,11 +322,11 @@ class RouteGeographyError(Exception):
 class InvalidRouteError(RouteGeographyError):
 """Raised when the supplied route is structurally invalid."""
 
-============================================================================
+
 
 ENGINE
 
-============================================================================
+
 
 class RouteGeographyEngine:
 """
