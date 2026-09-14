@@ -2,7 +2,7 @@
 itinerary_v2
 ============
 
-Top-level orchestrator for itinerary generation.
+Top-level deterministic itinerary generation orchestrator.
 
 Pipeline:
 
@@ -18,10 +18,10 @@ Pipeline:
     Destination Feasibility
         |
         v
-    Re-run RouteGeographyEngine for final route
+    Final RouteGeographyEngine
         |
         v
-    allocate_days_for_route()
+    Exact Day Allocation
         |
         v
     Day Records
@@ -36,23 +36,50 @@ Pipeline:
     ScheduleRepairEngine
         |
         v
+    Final Integrity Checks
+        |
+        v
     ValidationEngine
         |
         v
     Persisted Cabinet
 
-Important
----------
+Core invariants
+---------------
 
-The requested trip duration is authoritative.
+1. Requested trip duration is authoritative.
 
-If a user requests 7 days, the generated Cabinet must contain
-exactly 7 calendar days.
+   A request for 7 days produces exactly 7 calendar days.
 
-Destination feasibility happens before day allocation.
+2. User-selected destination order is authoritative.
 
-TRANSIT days are calendar days inside the requested trip duration.
-They are never added on top of the requested duration.
+   A -> B -> C remains A -> B -> C.
+
+3. Non-consecutive repeated destinations are valid.
+
+   A -> B -> A remains A -> B -> A.
+
+4. Consecutive duplicates may be normalized.
+
+   A -> A -> B becomes A -> B.
+
+5. Feasibility may NOT silently remove, swap, or reorder a user's
+   selected route.
+
+   If the requested route cannot be constructed within the requested
+   duration, generation fails rather than silently changing the journey.
+
+6. Transit days are calendar days inside the requested duration.
+
+7. RouteGeographyEngine is the authoritative source for route facts.
+
+8. The planner does not invent transport, duration, airport transfers,
+   or destination transitions.
+
+9. ScheduleRepairEngine may repair timing, but may not change geographic
+   identity.
+
+10. ValidationEngine is the final persisted integrity gate.
 """
 
 from __future__ import annotations
@@ -72,6 +99,7 @@ from app.engines.pipeline_adapters import (
     archetypes_by_day_number,
     day_records_from_route_analysis,
     find_feasible_destination_order,
+    normalize_destination_order,
     overnight_required_from_day_plan,
     schedule_input_from_cabinet,
     transit_days_from_day_plan,
@@ -88,15 +116,11 @@ from app.engines.validation import (
 )
 
 
-logger = logging.getLogger(
-    __name__
-)
+logger = logging.getLogger(__name__)
 
 
-class ItineraryGenerationError(
-    Exception
-):
-    """Raised when the itinerary generation pipeline cannot proceed."""
+class ItineraryGenerationError(Exception):
+    """Raised when the deterministic itinerary pipeline cannot proceed."""
 
 
 @dataclass
@@ -105,10 +129,7 @@ class ItineraryGenerationResult:
 
     cabinet: Any | None = None
 
-    rules_result: dict[
-        str,
-        Any,
-    ] | None = None
+    rules_result: dict[str, Any] | None = None
 
     route_analysis: Any | None = None
 
@@ -116,10 +137,7 @@ class ItineraryGenerationResult:
 
     schedule_repair_result: Any | None = None
 
-    validation_result: dict[
-        str,
-        Any,
-    ] | None = None
+    validation_result: dict[str, Any] | None = None
 
     warnings: list[str] = field(
         default_factory=list
@@ -130,25 +148,15 @@ class ItineraryGenerationResult:
     )
 
     @property
-    def succeeded(
-        self,
-    ) -> bool:
-
+    def succeeded(self) -> bool:
         return (
             self.cabinet is not None
-            and self.validation_result
-            is not None
-            and self.validation_result.get(
-                "status"
-            )
-            == "valid"
+            and self.validation_result is not None
+            and self.validation_result.get("status") == "valid"
         )
 
     @property
-    def status(
-        self,
-    ) -> str:
-
+    def status(self) -> str:
         if self.cabinet is None:
             return "failed"
 
@@ -162,47 +170,32 @@ class ItineraryGenerationResult:
 
 
 class ItineraryOrchestrator:
-    """Sequences the complete itinerary generation pipeline."""
+    """Sequences the complete deterministic itinerary pipeline."""
 
-    def __init__(
-        self,
-        db: Session,
-    ):
+    def __init__(self, db: Session):
         self.db = db
 
-        self.rules_engine = (
-            RulesEngine()
+        self.rules_engine = RulesEngine()
+
+        self.route_geography_engine = RouteGeographyEngine(
+            db
         )
 
-        self.route_geography_engine = (
-            RouteGeographyEngine(
-                db
-            )
-        )
-
-        self.day_archetype_engine = (
-            DayArchetypeEngine()
-        )
+        self.day_archetype_engine = DayArchetypeEngine()
 
         self.itinerary_planning_engine = (
-            ItineraryPlanningEngine(
-                db
-            )
+            ItineraryPlanningEngine(db)
         )
 
         self.schedule_repair_engine = (
             ScheduleRepairEngine()
         )
 
-        self.validation_engine = (
-            ValidationEngine(
-                db
-            )
-        )
+        self.validation_engine = ValidationEngine(db)
 
-    # ========================================================================
+    # ==================================================================
     # MAIN PIPELINE
-    # ========================================================================
+    # ==================================================================
 
     def generate(
         self,
@@ -212,20 +205,14 @@ class ItineraryOrchestrator:
         allow_coordinate_estimate: bool = False,
     ) -> ItineraryGenerationResult:
 
-        result = (
-            ItineraryGenerationResult()
-        )
+        result = ItineraryGenerationResult()
 
-        # ====================================================================
+        # ==============================================================
         # 1. REQUEST NORMALIZATION
-        # ====================================================================
+        # ==============================================================
 
-        cleaned_destination_ids = list(
-            dict.fromkeys(
-                str(destination_id)
-                for destination_id in destination_ids
-                if destination_id
-            )
+        cleaned_destination_ids = normalize_destination_order(
+            destination_ids
         )
 
         if not cleaned_destination_ids:
@@ -234,9 +221,7 @@ class ItineraryOrchestrator:
             )
 
         total_days = self._safe_int(
-            request.get(
-                "days"
-            ),
+            request.get("days"),
             0,
         )
 
@@ -245,212 +230,197 @@ class ItineraryOrchestrator:
                 "Trip duration must be greater than zero."
             )
 
-        # ====================================================================
+        requested_destination_ids = list(
+            cleaned_destination_ids
+        )
+
+        logger.info(
+            "Starting itinerary generation: route=%s days=%s",
+            requested_destination_ids,
+            total_days,
+        )
+
+        # ==============================================================
         # 2. RULES
-        # ====================================================================
+        # ==============================================================
 
-        rules_input = (
-            self._rules_input_from_request(
-                request,
-                cleaned_destination_ids,
-            )
+        rules_input = self._rules_input_from_request(
+            request,
+            requested_destination_ids,
         )
 
-        rules_result = (
-            self.rules_engine.evaluate_rules(
-                rules_input
-            )
+        rules_result = self.rules_engine.evaluate_rules(
+            rules_input
         )
 
-        result.rules_result = (
-            rules_result
-        )
+        result.rules_result = rules_result
 
-        if not rules_result[
-            "validated"
-        ]:
-
+        if not rules_result["validated"]:
             logger.warning(
                 "Itinerary request failed RulesEngine validation: %s",
-                rules_result[
-                    "errors"
-                ],
+                rules_result["errors"],
             )
 
             result.warnings.extend(
-                rules_result[
-                    "errors"
-                ]
+                rules_result["errors"]
             )
 
             result.warnings.extend(
-                rules_result[
-                    "warnings"
-                ]
+                rules_result["warnings"]
             )
 
             return result
 
         result.warnings.extend(
-            rules_result[
-                "warnings"
-            ]
+            rules_result["warnings"]
         )
 
-        # ====================================================================
+        # ==============================================================
         # 3. INITIAL ROUTE GEOGRAPHY
-        # ====================================================================
-        #
-        # This analysis is used only to understand the originally requested
-        # route and its factual geography.
-        #
-        # If feasibility later removes destinations, we MUST rerun this
-        # engine for the final route.
-        # ====================================================================
+        # ==============================================================
 
-        route_analysis = (
-            self.route_geography_engine.analyze(
-                cleaned_destination_ids,
-                allow_coordinate_estimate=(
-                    allow_coordinate_estimate
-                ),
-            )
+        route_analysis = self.route_geography_engine.analyze(
+            requested_destination_ids,
+            allow_coordinate_estimate=(
+                allow_coordinate_estimate
+            ),
         )
 
-        result.route_analysis = (
-            route_analysis
-        )
+        result.route_analysis = route_analysis
 
         result.warnings.extend(
-            route_analysis.warnings
+            getattr(
+                route_analysis,
+                "warnings",
+                [],
+            )
         )
 
-        if (
-            route_analysis.stop_count
-            == 0
-        ):
-            raise ItineraryGenerationError(
-                "RouteGeographyEngine could not resolve any "
-                "destinations for this request."
-            )
+        self._assert_route_analysis_matches_requested_route(
+            route_analysis,
+            requested_destination_ids,
+            stage="initial",
+        )
 
-        # ====================================================================
+        # ==============================================================
         # 4. DESTINATION METADATA
-        # ====================================================================
+        # ==============================================================
 
         destination_meta = (
-            self.itinerary_planning_engine
-            .fetch_destination_meta(
-                cleaned_destination_ids
+            self.itinerary_planning_engine.fetch_destination_meta(
+                requested_destination_ids
             )
         )
 
-        # ====================================================================
+        # ==============================================================
         # 5. DESTINATION FEASIBILITY
-        # ====================================================================
+        # ==============================================================
 
         (
             feasible_destination_ids,
             feasibility_warnings,
-        ) = (
-            find_feasible_destination_order(
-                destination_ids=(
-                    cleaned_destination_ids
-                ),
-                meta=destination_meta,
-                total_days=total_days,
-                route_analysis=route_analysis,
-            )
+        ) = find_feasible_destination_order(
+            destination_ids=requested_destination_ids,
+            meta=destination_meta,
+            total_days=total_days,
+            route_analysis=route_analysis,
         )
 
         result.warnings.extend(
             feasibility_warnings
         )
 
-        if not feasible_destination_ids:
-            raise ItineraryGenerationError(
-                "No feasible destination route could be constructed "
-                f"within {total_days} days."
-            )
-
-        if (
+        feasible_destination_ids = normalize_destination_order(
             feasible_destination_ids
-            != cleaned_destination_ids
-        ):
+        )
 
-            logger.warning(
-                "Destination route reduced for feasibility. "
-                "Requested=%s Final=%s",
-                cleaned_destination_ids,
+        # ==============================================================
+        # HARD USER-INTENT INVARIANT
+        # ==============================================================
+        #
+        # The previous orchestrator allowed:
+        #
+        # requested A -> B -> C -> D
+        #
+        # to become:
+        #
+        # final A -> B -> C
+        #
+        # merely because feasibility returned the largest feasible
+        # prefix.
+        #
+        # That is dangerous because the user did not ask for a different
+        # journey.
+        #
+        # We therefore fail explicitly when feasibility changes the
+        # selected route. The caller can then explain the problem or ask
+        # the traveler to reduce the route/duration.
+        # ==============================================================
+
+        if feasible_destination_ids != requested_destination_ids:
+            logger.error(
+                "Feasibility changed the requested destination route. "
+                "Requested=%s Feasible=%s",
+                requested_destination_ids,
                 feasible_destination_ids,
             )
 
-        # The feasible route is now authoritative.
-        cleaned_destination_ids = (
-            feasible_destination_ids
+            raise ItineraryGenerationError(
+                "The requested destination route cannot be constructed "
+                f"within {total_days} days without changing the user's "
+                "selected destinations or their order. "
+                f"Requested={requested_destination_ids}; "
+                f"Feasible={feasible_destination_ids}"
+            )
+
+        cleaned_destination_ids = list(
+            requested_destination_ids
         )
 
         result.destination_ids = list(
             cleaned_destination_ids
         )
 
-        # ====================================================================
-        # 6. RE-RUN ROUTE GEOGRAPHY
-        # ====================================================================
-        #
-        # IMPORTANT.
-        #
-        # The original route may have been:
-        #
-        # A -> B -> C -> D
-        #
-        # while the final route is:
-        #
-        # A -> B -> C
-        #
-        # Therefore the old RouteAnalysis must never be passed to the planner.
-        # ====================================================================
+        # ==============================================================
+        # 6. FINAL ROUTE GEOGRAPHY
+        # ==============================================================
 
-        route_analysis = (
-            self.route_geography_engine.analyze(
-                cleaned_destination_ids,
-                allow_coordinate_estimate=(
-                    allow_coordinate_estimate
-                ),
-            )
+        #
+        # Even when feasibility did not change the route, run the
+        # geography engine again so every downstream stage uses the
+        # authoritative final route analysis.
+        #
+
+        route_analysis = self.route_geography_engine.analyze(
+            cleaned_destination_ids,
+            allow_coordinate_estimate=(
+                allow_coordinate_estimate
+            ),
         )
 
-        result.route_analysis = (
-            route_analysis
-        )
+        result.route_analysis = route_analysis
 
         result.warnings.extend(
-            route_analysis.warnings
+            getattr(
+                route_analysis,
+                "warnings",
+                [],
+            )
         )
 
-        if (
-            route_analysis.stop_count
-            != len(
-                cleaned_destination_ids
-            )
-        ):
-            raise ItineraryGenerationError(
-                "Final RouteGeographyEngine analysis does not contain "
-                "all selected destinations: "
-                f"{route_analysis.stop_count} != "
-                f"{len(cleaned_destination_ids)}"
-            )
-
-        # ====================================================================
-        # 7. FINAL TRAVEL STYLE
-        # ====================================================================
-
-        travel_style = (
-            request.get(
-                "travel_style"
-            )
-            or []
+        self._assert_route_analysis_matches_requested_route(
+            route_analysis,
+            cleaned_destination_ids,
+            stage="final",
         )
+
+        # ==============================================================
+        # 7. TRAVEL STYLE
+        # ==============================================================
+
+        travel_style = request.get(
+            "travel_style"
+        ) or []
 
         if isinstance(
             travel_style,
@@ -468,55 +438,43 @@ class ItineraryOrchestrator:
             )
         )
 
-        # ====================================================================
+        # ==============================================================
         # 8. FINAL DESTINATION METADATA
-        # ====================================================================
-        #
-        # Re-fetch using the final selected route so no later stage depends
-        # on metadata for destinations that were removed.
-        # ====================================================================
+        # ==============================================================
 
         destination_meta = (
-            self.itinerary_planning_engine
-            .fetch_destination_meta(
+            self.itinerary_planning_engine.fetch_destination_meta(
                 cleaned_destination_ids
             )
         )
 
-        # ====================================================================
+        # ==============================================================
         # 9. EXACT DAY ALLOCATION
-        # ====================================================================
+        # ==============================================================
 
         (
             day_allocation,
             allocation_warnings,
-        ) = (
-            allocate_days_for_route(
-                destination_ids=(
-                    cleaned_destination_ids
-                ),
-                meta=destination_meta,
-                total_days=total_days,
-                travel_style=travel_style,
-                route_analysis=route_analysis,
-            )
+        ) = allocate_days_for_route(
+            destination_ids=cleaned_destination_ids,
+            meta=destination_meta,
+            total_days=total_days,
+            travel_style=travel_style,
+            route_analysis=route_analysis,
         )
 
         result.warnings.extend(
             allocation_warnings
         )
 
-        # HARD INVARIANT:
-        # The destination allocation MUST equal the requested calendar days.
+        # Exact allocation invariants.
 
-        if len(
-            day_allocation
-        ) != len(
+        if len(day_allocation) != len(
             cleaned_destination_ids
         ):
             raise ItineraryGenerationError(
-                "Destination allocation length does not match selected "
-                "destination count: "
+                "Destination allocation length does not match "
+                f"selected destination count: "
                 f"{len(day_allocation)} != "
                 f"{len(cleaned_destination_ids)}"
             )
@@ -526,63 +484,52 @@ class ItineraryOrchestrator:
             for value in day_allocation
         ):
             raise ItineraryGenerationError(
-                "A selected destination received fewer than one calendar "
-                f"day: {day_allocation}"
+                "A selected destination received fewer than one "
+                f"calendar day: {day_allocation}"
             )
 
-        allocated_destination_days = sum(
-            day_allocation
-        )
-
-        if (
-            allocated_destination_days
-            != total_days
-        ):
+        if sum(day_allocation) != total_days:
             raise ItineraryGenerationError(
-                "Destination allocation does not match requested trip "
-                f"duration: {allocated_destination_days} != "
-                f"{total_days}"
+                "Destination allocation does not match requested "
+                f"trip duration: "
+                f"{sum(day_allocation)} != {total_days}"
             )
 
         logger.info(
-            "Final itinerary allocation: destinations=%s allocation=%s "
-            "total_days=%s",
+            "Final itinerary allocation: destinations=%s "
+            "allocation=%s total_days=%s",
             cleaned_destination_ids,
             day_allocation,
             total_days,
         )
 
-        # ====================================================================
+        # ==============================================================
         # 10. PRE-PLANNING DAY RECORDS
-        # ====================================================================
-        #
-        # This must now generate exactly total_days records.
-        # ====================================================================
+        # ==============================================================
 
-        day_records = (
-            day_records_from_route_analysis(
-                route_analysis=route_analysis,
-                destination_order=(
-                    cleaned_destination_ids
-                ),
-                nights_per_destination=(
-                    day_allocation
-                ),
-                total_days=total_days,
-            )
+        day_records = day_records_from_route_analysis(
+            route_analysis=route_analysis,
+            destination_order=cleaned_destination_ids,
+            nights_per_destination=day_allocation,
+            total_days=total_days,
         )
 
-        if len(
-            day_records
-        ) != total_days:
+        if len(day_records) != total_days:
             raise ItineraryGenerationError(
-                "Pre-planning day records do not match requested trip "
-                f"duration: {len(day_records)} != {total_days}"
+                "Pre-planning day records do not match requested "
+                f"trip duration: {len(day_records)} != {total_days}"
             )
 
-        # ====================================================================
+        self._assert_day_record_route_integrity(
+            day_records,
+            cleaned_destination_ids,
+            total_days,
+            stage="pre-planning",
+        )
+
+        # ==============================================================
         # 11. PRE-PLANNING ARCHETYPES
-        # ====================================================================
+        # ==============================================================
 
         pre_planning_day_plan = (
             self.day_archetype_engine.analyze(
@@ -591,107 +538,111 @@ class ItineraryOrchestrator:
         )
 
         result.warnings.extend(
-            pre_planning_day_plan.warnings
-        )
-
-        # ====================================================================
-        # 12. TRANSIT CLASSIFICATION
-        # ====================================================================
-
-        transit_days = (
-            transit_days_from_day_plan(
+            getattr(
                 pre_planning_day_plan,
-                day_records=day_records,
+                "warnings",
+                [],
             )
         )
 
-        # ====================================================================
+        # ==============================================================
+        # 12. TRANSIT CLASSIFICATION
+        # ==============================================================
+
+        transit_days = transit_days_from_day_plan(
+            pre_planning_day_plan,
+            day_records=day_records,
+        )
+
+        transit_days = set(
+            transit_days or []
+        )
+
+        # ==============================================================
         # 13. BUILD CABINET
-        # ====================================================================
-        #
-        # The planner receives:
-        #
-        # final destination IDs
-        # exact day allocation
-        # route-aware transit classification
-        # authoritative final route facts
-        #
-        # The planner must not independently reconstruct geography.
-        # ====================================================================
+        # ==============================================================
 
         try:
-
             build_result = (
                 self.itinerary_planning_engine.build(
                     request=request,
-                    destination_ids=(
-                        cleaned_destination_ids
-                    ),
-                    day_allocation=(
-                        day_allocation
-                    ),
-                    transit_days=(
-                        transit_days
-                    ),
-                    route_facts=(
-                        route_analysis.legs
-                    ),
+                    destination_ids=cleaned_destination_ids,
+                    day_allocation=day_allocation,
+                    transit_days=transit_days,
+                    route_facts=route_analysis.legs,
                 )
             )
 
         except ValueError as exc:
-
             raise ItineraryGenerationError(
                 "ItineraryPlanningEngine could not build a cabinet: "
                 f"{exc}"
             ) from exc
 
-        cabinet = (
-            build_result.cabinet
-        )
+        cabinet = build_result.cabinet
 
-        result.cabinet = (
-            cabinet
-        )
+        result.cabinet = cabinet
 
         result.warnings.extend(
-            build_result.warnings
+            getattr(
+                build_result,
+                "warnings",
+                [],
+            )
         )
 
-        # ====================================================================
-        # 14. CABINET DAY COUNT INVARIANT
-        # ====================================================================
+        # ==============================================================
+        # 14. CABINET DAY COUNT
+        # ==============================================================
 
         cabinet_day_count = len(
-            cabinet.shelves
+            cabinet.shelves or []
         )
 
-        if (
-            cabinet_day_count
-            != total_days
-        ):
+        if cabinet_day_count != total_days:
             raise ItineraryGenerationError(
-                "ItineraryPlanningEngine produced the wrong number of "
-                "calendar days: "
+                "ItineraryPlanningEngine produced the wrong number "
+                "of calendar days: "
                 f"{cabinet_day_count} != requested {total_days}"
             )
 
-        if (
-            getattr(
-                cabinet,
-                "duration_days",
-                total_days,
-            )
-            != total_days
-        ):
+        if getattr(
+            cabinet,
+            "duration_days",
+            total_days,
+        ) != total_days:
             raise ItineraryGenerationError(
-                "Cabinet duration does not match requested trip duration: "
-                f"{cabinet.duration_days} != {total_days}"
+                "Cabinet duration does not match requested trip "
+                f"duration: {cabinet.duration_days} != {total_days}"
             )
 
-        # ====================================================================
-        # 15. RECONSTRUCT ACTUAL DESTINATION ALLOCATION
-        # ====================================================================
+        # ==============================================================
+        # 15. IMMEDIATE CABINET ROUTE INTEGRITY
+        # ==============================================================
+
+        actual_destination_order = (
+            self._destination_order_from_cabinet(
+                cabinet
+            )
+        )
+
+        if actual_destination_order != cleaned_destination_ids:
+            raise ItineraryGenerationError(
+                "ItineraryPlanningEngine changed the authoritative "
+                "destination route. "
+                f"Expected={cleaned_destination_ids} "
+                f"Actual={actual_destination_order}"
+            )
+
+        self._assert_shelf_sequence_matches_route(
+            cabinet,
+            cleaned_destination_ids,
+            stage="post-planning",
+        )
+
+        # ==============================================================
+        # 16. RECONSTRUCT ACTUAL DESTINATION ALLOCATION
+        # ==============================================================
 
         nights_per_destination = (
             self._nights_per_destination_from_cabinet(
@@ -699,119 +650,98 @@ class ItineraryOrchestrator:
             )
         )
 
-        if sum(
-            nights_per_destination
-        ) != total_days:
+        if sum(nights_per_destination) != total_days:
             raise ItineraryGenerationError(
-                "Persisted Cabinet destination allocation does not match "
-                f"requested duration: "
+                "Persisted Cabinet destination allocation does not "
+                "match requested duration: "
                 f"{sum(nights_per_destination)} != {total_days}"
             )
 
-        # ====================================================================
-        # 16. COUNT ACTUAL ACTIVITIES
-        # ====================================================================
+        if len(nights_per_destination) != len(
+            cleaned_destination_ids
+        ):
+            raise ItineraryGenerationError(
+                "Persisted Cabinet contains an unexpected number "
+                "of destination segments. "
+                f"Expected={len(cleaned_destination_ids)} "
+                f"Actual={len(nights_per_destination)}"
+            )
+
+        # ==============================================================
+        # 17. ACTIVITY COUNTS
+        # ==============================================================
 
         activity_counts_by_day = {
             shelf.day_number: sum(
                 1
-                for drawer in shelf.drawers
-                if drawer.activity_type
-                == "EXPERIENCE"
+                for drawer in shelf.drawers or []
+                if drawer.activity_type == "EXPERIENCE"
             )
-            for shelf in cabinet.shelves
+            for shelf in cabinet.shelves or []
         }
 
-        # ====================================================================
-        # 17. FINAL DESTINATION ORDER
-        # ====================================================================
-
-        final_destination_order = (
-            self._destination_order_from_cabinet(
-                cabinet
-            )
-        )
-
-        if (
-            final_destination_order
-            != cleaned_destination_ids
-        ):
-            raise ItineraryGenerationError(
-                "Persisted Cabinet destination order does not match the "
-                "authoritative selected route. "
-                f"Expected={cleaned_destination_ids} "
-                f"Actual={final_destination_order}"
-            )
-
-        # ====================================================================
+        # ==============================================================
         # 18. REBUILD DAY RECORDS FROM ACTUAL CABINET
-        # ====================================================================
+        # ==============================================================
 
-        day_records = (
-            day_records_from_route_analysis(
-                route_analysis=route_analysis,
-                destination_order=(
-                    final_destination_order
-                ),
-                nights_per_destination=(
-                    nights_per_destination
-                ),
-                total_days=cabinet.duration_days,
-                activity_counts_by_day=(
-                    activity_counts_by_day
-                ),
-            )
+        day_records = day_records_from_route_analysis(
+            route_analysis=route_analysis,
+            destination_order=cleaned_destination_ids,
+            nights_per_destination=nights_per_destination,
+            total_days=cabinet.duration_days,
+            activity_counts_by_day=activity_counts_by_day,
         )
 
-        if len(
-            day_records
-        ) != total_days:
+        if len(day_records) != total_days:
             raise ItineraryGenerationError(
-                "Final day records do not match requested trip duration: "
-                f"{len(day_records)} != {total_days}"
+                "Final day records do not match requested trip "
+                f"duration: {len(day_records)} != {total_days}"
             )
 
-        # ====================================================================
+        self._assert_day_record_route_integrity(
+            day_records,
+            cleaned_destination_ids,
+            total_days,
+            stage="post-planning",
+        )
+
+        # ==============================================================
         # 19. FINAL DAY CLASSIFICATION
-        # ====================================================================
+        # ==============================================================
 
-        day_plan = (
-            self.day_archetype_engine.analyze(
-                day_records
-            )
+        day_plan = self.day_archetype_engine.analyze(
+            day_records
         )
 
-        result.day_plan = (
-            day_plan
-        )
+        result.day_plan = day_plan
 
         result.warnings.extend(
-            day_plan.warnings
+            getattr(
+                day_plan,
+                "warnings",
+                [],
+            )
         )
 
-        # ====================================================================
+        # ==============================================================
         # 20. APPLY DAY THEMES
-        # ====================================================================
+        # ==============================================================
 
         self._apply_day_themes(
             cabinet,
             day_plan,
         )
 
-        # ====================================================================
+        # ==============================================================
         # 21. SCHEDULE REPAIR
-        # ====================================================================
+        # ==============================================================
 
-        schedule_input = (
-            schedule_input_from_cabinet(
-                cabinet
-            )
+        schedule_input = schedule_input_from_cabinet(
+            cabinet
         )
 
-        archetypes = (
-            archetypes_by_day_number(
-                day_plan
-            )
+        archetypes = archetypes_by_day_number(
+            day_plan
         )
 
         repair_result = (
@@ -821,22 +751,21 @@ class ItineraryOrchestrator:
             )
         )
 
-        result.schedule_repair_result = (
-            repair_result
-        )
+        result.schedule_repair_result = repair_result
 
         result.warnings.extend(
-            repair_result.warnings
+            getattr(
+                repair_result,
+                "warnings",
+                [],
+            )
         )
 
         if repair_result.actions:
-
             logger.info(
                 "ScheduleRepairEngine applied %s repair action(s) "
                 "to cabinet %s.",
-                len(
-                    repair_result.actions
-                ),
+                len(repair_result.actions),
                 cabinet.id,
             )
 
@@ -846,15 +775,52 @@ class ItineraryOrchestrator:
             )
 
         if not repair_result.fully_repaired:
-
             result.warnings.append(
                 "One or more schedule conflicts remain after "
                 "automated repair and require manual review."
             )
 
-        # ====================================================================
-        # 22. FINAL VALIDATION
-        # ====================================================================
+        # ==============================================================
+        # 22. POST-REPAIR ROUTE INTEGRITY
+        # ==============================================================
+
+        #
+        # ScheduleRepairEngine is deliberately conservative, but this
+        # second guard is still necessary.
+        #
+        # If a repair accidentally moved a Drawer or changed the
+        # persisted shelf relationship incorrectly, we fail before
+        # returning the Cabinet.
+        #
+
+        repaired_destination_order = (
+            self._destination_order_from_cabinet(
+                cabinet
+            )
+        )
+
+        if repaired_destination_order != cleaned_destination_ids:
+            raise ItineraryGenerationError(
+                "ScheduleRepairEngine changed the itinerary "
+                "destination order. "
+                f"Expected={cleaned_destination_ids} "
+                f"Actual={repaired_destination_order}"
+            )
+
+        self._assert_shelf_sequence_matches_route(
+            cabinet,
+            cleaned_destination_ids,
+            stage="post-repair",
+        )
+
+        self._assert_drawer_destination_integrity(
+            cabinet,
+            stage="post-repair",
+        )
+
+        # ==============================================================
+        # 23. FINAL VALIDATION
+        # ==============================================================
 
         overnight_required = (
             overnight_required_from_day_plan(
@@ -862,33 +828,250 @@ class ItineraryOrchestrator:
             )
         )
 
+        #
+        # Pass the COMPLETE deterministic warning chain to validation,
+        # not merely build_result.warnings.
+        #
+        validation_input_warnings = list(
+            result.warnings
+        )
+
         validation_result = (
             self.validation_engine.validate(
                 cabinet,
-                extra_warnings=(
-                    build_result.warnings
-                ),
-                overnight_required=(
-                    overnight_required
-                ),
+                extra_warnings=validation_input_warnings,
+                overnight_required=overnight_required,
             )
         )
 
-        result.validation_result = (
-            validation_result
-        )
+        result.validation_result = validation_result
 
         result.warnings.extend(
-            validation_result[
-                "warnings"
-            ]
+            validation_result.get(
+                "warnings",
+                [],
+            )
+        )
+
+        result.warnings = self._dedupe_strings(
+            result.warnings
         )
 
         return result
 
-    # ========================================================================
-    # HELPERS
-    # ========================================================================
+    # ==================================================================
+    # ROUTE ASSERTIONS
+    # ==================================================================
+
+    @staticmethod
+    def _assert_route_analysis_matches_requested_route(
+        route_analysis: Any,
+        destination_ids: list[str],
+        *,
+        stage: str,
+    ) -> None:
+        """
+        Ensure RouteGeographyEngine preserved the requested ordered route.
+
+        We intentionally inspect ordered legs rather than relying solely
+        on stop_count because a count does not prove sequence integrity.
+        """
+
+        expected = normalize_destination_order(
+            destination_ids
+        )
+
+        if not expected:
+            raise ItineraryGenerationError(
+                f"{stage} route analysis received no destinations."
+            )
+
+        legs = list(
+            getattr(
+                route_analysis,
+                "legs",
+                [],
+            )
+            or []
+        )
+
+        if len(expected) == 1:
+            if legs:
+                raise ItineraryGenerationError(
+                    f"{stage} route analysis contains route legs "
+                    "for a single-destination route."
+                )
+            return
+
+        if len(legs) != len(expected) - 1:
+            raise ItineraryGenerationError(
+                f"{stage} route analysis contains the wrong number "
+                "of route legs: "
+                f"{len(legs)} != {len(expected) - 1}"
+            )
+
+        for index, leg in enumerate(legs):
+            expected_from = expected[index]
+            expected_to = expected[index + 1]
+
+            actual_from = getattr(
+                leg,
+                "from_destination_id",
+                None,
+            )
+
+            actual_to = getattr(
+                leg,
+                "to_destination_id",
+                None,
+            )
+
+            if actual_from != expected_from:
+                raise ItineraryGenerationError(
+                    f"{stage} route analysis changed route order at "
+                    f"leg {index + 1}: expected from "
+                    f"{expected_from}, found {actual_from}."
+                )
+
+            if actual_to != expected_to:
+                raise ItineraryGenerationError(
+                    f"{stage} route analysis changed route order at "
+                    f"leg {index + 1}: expected to "
+                    f"{expected_to}, found {actual_to}."
+                )
+
+    @staticmethod
+    def _assert_day_record_route_integrity(
+        day_records: list[Any],
+        destination_ids: list[str],
+        total_days: int,
+        *,
+        stage: str,
+    ) -> None:
+
+        if len(day_records) != total_days:
+            raise ItineraryGenerationError(
+                f"{stage} day-record count is invalid: "
+                f"{len(day_records)} != {total_days}"
+            )
+
+        expected_segments = normalize_destination_order(
+            destination_ids
+        )
+
+        actual_destinations = []
+
+        for record in day_records:
+            destination_id = getattr(
+                record,
+                "destination_id",
+                None,
+            )
+
+            if destination_id:
+                actual_destinations.append(
+                    destination_id
+                )
+
+        actual_segments = normalize_destination_order(
+            actual_destinations
+        )
+
+        if actual_segments != expected_segments:
+            raise ItineraryGenerationError(
+                f"{stage} day records changed destination order. "
+                f"Expected={expected_segments} "
+                f"Actual={actual_segments}"
+            )
+
+    @staticmethod
+    def _assert_shelf_sequence_matches_route(
+        cabinet: Any,
+        destination_ids: list[str],
+        *,
+        stage: str,
+    ) -> None:
+
+        shelves = sorted(
+            list(cabinet.shelves or []),
+            key=lambda shelf: (
+                shelf.day_number
+                if shelf.day_number is not None
+                else 10**9,
+                str(shelf.id),
+            ),
+        )
+
+        actual_destinations = [
+            shelf.destination_id
+            for shelf in shelves
+            if getattr(
+                shelf,
+                "destination_id",
+                None,
+            )
+        ]
+
+        actual_segments = normalize_destination_order(
+            actual_destinations
+        )
+
+        expected_segments = normalize_destination_order(
+            destination_ids
+        )
+
+        if actual_segments != expected_segments:
+            raise ItineraryGenerationError(
+                f"{stage} shelf destination sequence does not "
+                "match the authoritative route. "
+                f"Expected={expected_segments} "
+                f"Actual={actual_segments}"
+            )
+
+    @staticmethod
+    def _assert_drawer_destination_integrity(
+        cabinet: Any,
+        *,
+        stage: str,
+    ) -> None:
+
+        for shelf in cabinet.shelves or []:
+            shelf_destination = getattr(
+                shelf,
+                "destination_id",
+                None,
+            )
+
+            if not shelf_destination:
+                raise ItineraryGenerationError(
+                    f"{stage}: Day {shelf.day_number} has no "
+                    "destination_id."
+                )
+
+            for drawer in shelf.drawers or []:
+                drawer_destination = getattr(
+                    drawer,
+                    "destination_id",
+                    None,
+                )
+
+                if not drawer_destination:
+                    raise ItineraryGenerationError(
+                        f"{stage}: Day {shelf.day_number} activity "
+                        f"'{drawer.name}' has no destination_id."
+                    )
+
+                if drawer_destination != shelf_destination:
+                    raise ItineraryGenerationError(
+                        f"{stage}: Day {shelf.day_number} activity "
+                        f"'{drawer.name}' belongs to destination "
+                        f"{drawer_destination}, while the shelf belongs "
+                        f"to {shelf_destination}."
+                    )
+
+    # ==================================================================
+    # CABINET HELPERS
+    # ==================================================================
 
     @staticmethod
     def _safe_int(
@@ -897,9 +1080,7 @@ class ItineraryOrchestrator:
     ) -> int:
 
         try:
-            return int(
-                value
-            )
+            return int(value)
         except (
             TypeError,
             ValueError,
@@ -913,16 +1094,12 @@ class ItineraryOrchestrator:
     ) -> dict[str, Any]:
 
         return {
-            "days": request.get(
-                "days"
-            ),
+            "days": request.get("days"),
             "travelers": request.get(
                 "travelers",
                 1,
             ),
-            "destination_ids": (
-                destination_ids
-            ),
+            "destination_ids": destination_ids,
             "budget_tier": request.get(
                 "budget_tier",
                 "mid",
@@ -940,34 +1117,42 @@ class ItineraryOrchestrator:
         cabinet: Any,
     ) -> list[int]:
 
+        """
+        Reconstruct destination-day segments from persisted shelves.
+
+        This intentionally preserves:
+
+            A -> B -> A
+
+        as:
+
+            [days_at_A, days_at_B, days_at_A]
+
+        rather than merging both A segments together.
+        """
+
         nights: list[int] = []
 
         current_destination = None
 
-        for shelf in cabinet.shelves:
+        shelves = sorted(
+            list(cabinet.shelves or []),
+            key=lambda shelf: (
+                shelf.day_number
+                if shelf.day_number is not None
+                else 10**9,
+                str(shelf.id),
+            ),
+        )
 
-            destination_id = (
-                shelf.destination_id
-            )
+        for shelf in shelves:
+            destination_id = shelf.destination_id
 
-            if (
-                destination_id
-                != current_destination
-            ):
-
-                nights.append(
-                    1
-                )
-
-                current_destination = (
-                    destination_id
-                )
-
+            if destination_id != current_destination:
+                nights.append(1)
+                current_destination = destination_id
             else:
-
-                nights[
-                    -1
-                ] += 1
+                nights[-1] += 1
 
         return nights
 
@@ -976,31 +1161,45 @@ class ItineraryOrchestrator:
         cabinet: Any,
     ) -> list[str]:
 
-        order: list[str] = []
+        """
+        Return the ordered geographic sequence represented by shelves.
 
-        seen: set[str] = set()
+        Only consecutive duplicates are removed.
 
-        for shelf in cabinet.shelves:
+        Therefore:
 
-            destination_id = (
-                shelf.destination_id
+            A -> A -> B -> B -> A
+
+        becomes:
+
+            A -> B -> A
+
+        not:
+
+            A -> B
+        """
+
+        destinations = [
+            shelf.destination_id
+            for shelf in sorted(
+                list(cabinet.shelves or []),
+                key=lambda shelf: (
+                    shelf.day_number
+                    if shelf.day_number is not None
+                    else 10**9,
+                    str(shelf.id),
+                ),
             )
+            if getattr(
+                shelf,
+                "destination_id",
+                None,
+            )
+        ]
 
-            if (
-                destination_id
-                and destination_id
-                not in seen
-            ):
-
-                seen.add(
-                    destination_id
-                )
-
-                order.append(
-                    destination_id
-                )
-
-        return order
+        return normalize_destination_order(
+            destinations
+        )
 
     @staticmethod
     def _apply_day_themes(
@@ -1010,41 +1209,40 @@ class ItineraryOrchestrator:
 
         shelf_by_day_number = {
             shelf.day_number: shelf
-            for shelf in cabinet.shelves
+            for shelf in cabinet.shelves or []
         }
 
-        for day_result in day_plan.days:
+        for day_result in getattr(
+            day_plan,
+            "days",
+            [],
+        ):
 
-            shelf = (
-                shelf_by_day_number.get(
-                    day_result.day_number
-                )
+            shelf = shelf_by_day_number.get(
+                day_result.day_number
             )
 
             if shelf is None:
                 continue
 
-            # TRANSIT days have their dedicated downstream presentation.
             if (
-                getattr(
-                    shelf,
-                    "day_kind",
-                    "STANDARD",
-                )
+                str(
+                    getattr(
+                        shelf,
+                        "day_kind",
+                        "STANDARD",
+                    )
+                ).upper()
                 == "TRANSIT"
             ):
                 continue
 
-            derived_theme = (
-                _theme_from_archetype(
-                    day_result.archetype
-                )
+            derived_theme = _theme_from_archetype(
+                day_result.archetype
             )
 
             if derived_theme:
-                shelf.theme = (
-                    derived_theme
-                )
+                shelf.theme = derived_theme
 
     @staticmethod
     def _apply_repair_actions_to_cabinet(
@@ -1054,58 +1252,51 @@ class ItineraryOrchestrator:
 
         from datetime import time as dt_time
 
-        drawer_by_id: dict[
-            Any,
-            Any,
-        ] = {
+        drawer_by_id = {
             drawer.id: drawer
-            for shelf in cabinet.shelves
-            for drawer in shelf.drawers
+            for shelf in cabinet.shelves or []
+            for drawer in shelf.drawers or []
         }
 
-        shelf_by_day_number: dict[
-            int,
-            Any,
-        ] = {
+        shelf_by_day_number = {
             shelf.day_number: shelf
-            for shelf in cabinet.shelves
+            for shelf in cabinet.shelves or []
         }
 
-        for action in repair_result.actions:
+        for action in getattr(
+            repair_result,
+            "actions",
+            [],
+        ):
 
             drawer = drawer_by_id.get(
                 action.activity_id
             )
 
             if drawer is None:
-
                 logger.warning(
-                    "ScheduleRepairEngine referenced activity_id "
-                    "%s which does not match any persisted Drawer; "
+                    "ScheduleRepairEngine referenced activity_id %s "
+                    "which does not match any persisted Drawer; "
                     "skipping this repair action.",
                     action.activity_id,
                 )
-
                 continue
 
-            if (
-                action.to_start_minutes
-                is not None
-            ):
+            if action.to_start_minutes is not None:
 
-                drawer.start_time = (
-                    dt_time(
+                minutes = max(
+                    0,
+                    int(
                         action.to_start_minutes
-                        // 60,
-                        action.to_start_minutes
-                        % 60,
-                    )
+                    ),
                 )
 
-            if (
-                action.to_day
-                != action.from_day
-            ):
+                drawer.start_time = dt_time(
+                    minutes // 60,
+                    minutes % 60,
+                )
+
+            if action.to_day != action.from_day:
 
                 source_shelf = (
                     shelf_by_day_number.get(
@@ -1120,32 +1311,93 @@ class ItineraryOrchestrator:
                 )
 
                 if (
-                    source_shelf is not None
-                    and destination_shelf
-                    is not None
+                    source_shelf is None
+                    or destination_shelf is None
                 ):
+                    logger.warning(
+                        "ScheduleRepairEngine requested movement of "
+                        "activity %s between missing days %s -> %s.",
+                        action.activity_id,
+                        action.from_day,
+                        action.to_day,
+                    )
+                    continue
 
-                    if (
+                # ------------------------------------------------------
+                # Final destination safety.
+                #
+                # ScheduleRepairEngine should already guarantee this,
+                # but the orchestrator must never move an activity into
+                # a different geographic destination.
+                # ------------------------------------------------------
+
+                drawer_destination = getattr(
+                    drawer,
+                    "destination_id",
+                    None,
+                )
+
+                target_destination = getattr(
+                    destination_shelf,
+                    "destination_id",
+                    None,
+                )
+
+                if (
+                    drawer_destination is None
+                    or target_destination is None
+                    or drawer_destination
+                    != target_destination
+                ):
+                    raise ItineraryGenerationError(
+                        "ScheduleRepairEngine attempted to move activity "
+                        f"'{drawer.name}' to a different destination. "
+                        f"Activity destination={drawer_destination}; "
+                        f"target shelf destination={target_destination}"
+                    )
+
+                if drawer in source_shelf.drawers:
+                    source_shelf.drawers.remove(
                         drawer
-                        in source_shelf.drawers
-                    ):
+                    )
 
-                        source_shelf.drawers.remove(
-                            drawer
-                        )
-
+                if drawer not in destination_shelf.drawers:
                     destination_shelf.drawers.append(
                         drawer
                     )
 
-                    drawer.shelf_id = (
-                        destination_shelf.id
-                    )
+                drawer.shelf_id = (
+                    destination_shelf.id
+                )
+
+    # ==================================================================
+    # WARNING HELPERS
+    # ==================================================================
+
+    @staticmethod
+    def _dedupe_strings(
+        values: list[str],
+    ) -> list[str]:
+
+        result: list[str] = []
+        seen: set[str] = set()
+
+        for value in values:
+            if not value:
+                continue
+
+            if value in seen:
+                continue
+
+            seen.add(value)
+            result.append(value)
+
+        return result
 
 
-# ============================================================================
+# ========================================================================
 # DAY THEMES
-# ============================================================================
+# ========================================================================
 
 def _theme_from_archetype(
     archetype: Any,
@@ -1158,52 +1410,26 @@ def _theme_from_archetype(
     )
 
     mapping = {
-        "safari": (
-            "Wildlife & wide horizons"
-        ),
-        "wildlife": (
-            "Wildlife & wide horizons"
-        ),
-        "beach": (
-            "Coast, water & open horizons"
-        ),
-        "relaxation": (
-            "Coast, water & open horizons"
-        ),
-        "cultural": (
-            "Culture & discovery"
-        ),
-        "city_exploration": (
-            "Culture & discovery"
-        ),
-        "nature": (
-            "Nature & exploration"
-        ),
-        "adventure": (
-            "Nature & exploration"
-        ),
-        "exploration": (
-            "Explore the destination"
-        ),
-        "mixed": (
-            "Explore the destination"
-        ),
-        "free": (
-            "Free time at the lodge"
-        ),
-        "recovery": (
-            "Rest & recovery"
-        ),
+        "safari": "Wildlife & wide horizons",
+        "wildlife": "Wildlife & wide horizons",
+        "beach": "Coast, water & open horizons",
+        "relaxation": "Coast, water & open horizons",
+        "cultural": "Culture & discovery",
+        "city_exploration": "Culture & discovery",
+        "nature": "Nature & exploration",
+        "adventure": "Nature & exploration",
+        "exploration": "Explore the destination",
+        "mixed": "Explore the destination",
+        "free": "Free time at the lodge",
+        "recovery": "Rest & recovery",
     }
 
-    return mapping.get(
-        value
-    )
+    return mapping.get(value)
 
 
-# ============================================================================
+# ========================================================================
 # PUBLIC ENTRY POINT
-# ============================================================================
+# ========================================================================
 
 def generate_itinerary(
     db: Session,
@@ -1218,9 +1444,7 @@ def generate_itinerary(
     ).generate(
         request,
         destination_ids,
-        allow_coordinate_estimate=(
-            allow_coordinate_estimate
-        ),
+        allow_coordinate_estimate=allow_coordinate_estimate,
     )
 
 
