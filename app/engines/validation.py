@@ -1,7 +1,7 @@
 """
 ValidationEngine
 
-Validates a persisted Cabinet against deterministic travel constraints.
+Final deterministic integrity gate for a persisted Cabinet.
 
 Pipeline:
 
@@ -15,43 +15,45 @@ Pipeline:
         |
     RETURN
 
-No AI is used to determine whether an itinerary is physically viable.
+This engine does NOT decide whether an itinerary is desirable using AI.
 
-CHANGE LOG (audit-confirmed fixes)
-------------------------------------
-1. Midnight-safe overlap detection.
+Its responsibility is to verify that the persisted itinerary still
+represents a physically and structurally coherent deterministic plan.
 
-   The previous implementation computed an activity's end time via
-   ``(datetime.combine(...) + timedelta(...)).time()`` and then
-   compared bare ``datetime.time`` objects. Discarding the date
-   component after the addition silently loses any day rollover: a
-   22:30 start + 180 minutes becomes "01:30", which then compares as
-   LESS than a 22:30 start on the same nominal day, even though it is
-   actually later, on the next calendar day. Overlap detection now
-   keeps full ``datetime`` values (not bare ``time`` values) all the
-   way through the comparison, so a cross-midnight activity is
-   correctly ordered relative to the rest of the day's schedule.
+Validation layers:
 
-2. Departure-day accommodation semantics.
+1. Calendar / schedule integrity
+2. Accommodation integrity
+3. Activity provenance integrity
+4. Transfer feasibility
+5. Border integrity
+6. Route identity and exact sequence
+7. Shelf -> destination integrity
+8. Drawer -> destination integrity
+9. Hinge continuity
+10. Transit-day integrity
+11. Requested-route preservation where safely comparable
+12. Exact requested duration
+13. Allocation / upstream warnings
 
-   The previous implementation flagged EVERY shelf with no attached
-   Headboard as an error, with no way to know that a departure day is
-   a checkout day rather than an overnight stay. This engine now
-   accepts an optional ``overnight_required`` lookup (day_number ->
-   bool), sourced from DayArchetypeEngine's classification. When a
-   day's archetype indicates overnight accommodation is not expected
-   (e.g. DEPARTURE), a missing Headboard is no longer an error. When
-   the archetype is unknown (the lookup is not supplied, or contains
-   no entry for that day), the engine falls back to the previous
-   conservative behavior of requiring accommodation -- it does not
-   silently loosen validation just because the day-archetype pipeline
-   has not been wired in yet for a given caller.
+Important principles
+--------------------
+- A -> B -> A is a valid route and must NOT be collapsed into A -> B.
+- Consecutive duplicate destination IDs are treated as one route position
+  because they represent multiple days at the same destination, not a new
+  geographic transition.
+- Non-consecutive repeats are preserved and explicitly supported.
+- Unknown transport duration is missing information, not fabricated
+  feasibility.
+- The validator reports integrity problems; it does not silently repair them.
+- A departure day may legitimately have no accommodation when the caller
+  explicitly supplies overnight_required[day] == False.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, time as dt_time, timedelta
-from typing import Any, Mapping
+from datetime import date, datetime, timedelta
+from typing import Any, Mapping, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -68,8 +70,14 @@ class ValidationEngine:
     LONG_TRANSFER_MINUTES = 240
     HARD_TRANSFER_MINUTES = 8 * 60
 
+    VALID_DAY_KINDS = {"STANDARD", "TRANSIT"}
+
     def __init__(self, db: Session):
         self.db = db
+
+    # ==================================================================
+    # PUBLIC API
+    # ==================================================================
 
     def validate(
         self,
@@ -79,46 +87,147 @@ class ValidationEngine:
         overnight_required: Mapping[int, bool] | None = None,
     ) -> dict[str, Any]:
         """
+        Validate the persisted Cabinet.
+
         Parameters
         ----------
         cabinet:
-            The persisted Cabinet to validate.
+            Persisted Cabinet to validate.
+
         extra_warnings:
-            Warnings surfaced during upstream day allocation.
+            Warnings produced by upstream deterministic stages such as
+            route feasibility and day allocation.
+
         overnight_required:
-            Optional mapping of day_number -> bool, sourced from
-            DayArchetypeEngine's classification (or equivalent). When a
-            day is present in this mapping with value False, a missing
-            Headboard for that day is not treated as an error -- e.g. a
-            DEPARTURE day is a checkout day, not an overnight stay. Any
-            day NOT present in this mapping keeps the previous
-            conservative default of requiring accommodation, so callers
-            that have not yet wired in day-archetype classification see
-            no change in behavior.
+            Optional day_number -> bool lookup.
+
+            False means that day does not require an overnight stay,
+            e.g. a genuine departure day.
+
+            If the mapping is absent, accommodation validation retains
+            the conservative historical behavior and requires an
+            accommodation record.
         """
 
         issues: list[Footstool] = []
 
-        for shelf in cabinet.shelves:
-            issues += self._check_time_overlaps(cabinet, shelf)
-            issues += self._check_accommodation_present(
-                cabinet,
-                shelf,
-                overnight_required=overnight_required,
-            )
-            issues += self._check_fallback_activities(cabinet, shelf)
+        # --------------------------------------------------------------
+        # Per-day validation
+        # --------------------------------------------------------------
 
-        issues += self._check_transfer_feasibility(cabinet)
-        issues += self._check_border_crossings(cabinet)
-        issues += self._check_route_integrity(cabinet)
-        issues += self._check_allocation_warnings(cabinet, extra_warnings or [])
+        for shelf in sorted(
+            list(cabinet.shelves or []),
+            key=lambda s: (
+                s.day_number if s.day_number is not None else 10**9,
+                str(s.id),
+            ),
+        ):
+            issues.extend(
+                self._check_time_overlaps(
+                    cabinet,
+                    shelf,
+                )
+            )
+
+            issues.extend(
+                self._check_accommodation_present(
+                    cabinet,
+                    shelf,
+                    overnight_required=overnight_required,
+                )
+            )
+
+            issues.extend(
+                self._check_fallback_activities(
+                    cabinet,
+                    shelf,
+                )
+            )
+
+            issues.extend(
+                self._check_shelf_destination_integrity(
+                    cabinet,
+                    shelf,
+                )
+            )
+
+            issues.extend(
+                self._check_drawer_destination_integrity(
+                    cabinet,
+                    shelf,
+                )
+            )
+
+            issues.extend(
+                self._check_day_kind_integrity(
+                    cabinet,
+                    shelf,
+                )
+            )
+
+        # --------------------------------------------------------------
+        # Cross-day / route validation
+        # --------------------------------------------------------------
+
+        issues.extend(
+            self._check_transfer_feasibility(cabinet)
+        )
+
+        issues.extend(
+            self._check_border_crossings(cabinet)
+        )
+
+        issues.extend(
+            self._check_route_integrity(cabinet)
+        )
+
+        issues.extend(
+            self._check_hinge_integrity(cabinet)
+        )
+
+        issues.extend(
+            self._check_destination_transition_integrity(cabinet)
+        )
+
+        issues.extend(
+            self._check_transit_day_integrity(cabinet)
+        )
+
+        issues.extend(
+            self._check_requested_route_preservation(cabinet)
+        )
+
+        issues.extend(
+            self._check_allocation_warnings(
+                cabinet,
+                extra_warnings or [],
+            )
+        )
+
+        # --------------------------------------------------------------
+        # De-duplicate identical issues before persistence.
+        #
+        # Multiple integrity checks can legitimately discover the same
+        # underlying problem. Persisting the exact same Footstool several
+        # times makes the validation output noisy without adding evidence.
+        # --------------------------------------------------------------
+
+        issues = self._deduplicate_issues(issues)
 
         for issue in issues:
             self.db.add(issue)
+
         self.db.flush()
 
-        has_errors = any(i.severity == "error" for i in issues)
-        has_warnings = any(i.severity == "warning" for i in issues)
+        has_errors = any(
+            issue.severity == "error"
+            for issue in issues
+        )
+
+        has_warnings = any(
+            issue.severity == "warning"
+            for issue in issues
+        )
 
         cabinet.status = "draft" if has_errors else "ready"
         self.db.add(cabinet)
@@ -126,60 +235,111 @@ class ValidationEngine:
         return {
             "status": "invalid" if has_errors else "valid",
             "issue_count": len(issues),
-            "error_count": sum(1 for i in issues if i.severity == "error"),
-            "warning_count": sum(1 for i in issues if i.severity == "warning"),
-            "errors": [i.message for i in issues if i.severity == "error"],
-            "warnings": [i.message for i in issues if i.severity == "warning"],
+            "error_count": sum(
+                1 for issue in issues
+                if issue.severity == "error"
+            ),
+            "warning_count": sum(
+                1 for issue in issues
+                if issue.severity == "warning"
+            ),
+            "errors": [
+                issue.message
+                for issue in issues
+                if issue.severity == "error"
+            ],
+            "warnings": [
+                issue.message
+                for issue in issues
+                if issue.severity == "warning"
+            ],
             "has_warnings": has_warnings,
         }
 
-    # ------------------------------------------------------------------
-    # TIME OVERLAPS -- midnight-safe
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # TIME OVERLAPS
+    # ==================================================================
 
-    def _check_time_overlaps(self, cabinet: Cabinet, shelf: Shelf) -> list[Footstool]:
+    def _check_time_overlaps(
+        self,
+        cabinet: Cabinet,
+        shelf: Shelf,
+    ) -> list[Footstool]:
+        """
+        Detect overlapping timed activities.
+
+        Full datetime values are retained throughout the calculation.
+
+        Schedule order is based primarily on sort_order. This is
+        important because a schedule such as:
+
+            23:00 -> 00:30
+
+        is valid when 00:30 belongs to the following clock-day segment
+        of the same itinerary day.
+
+        Activities without both a start time and positive duration are
+        not candidates for mathematical overlap validation.
+        """
+
         issues: list[Footstool] = []
 
-        timed = sorted(
-            [
-                d
-                for d in shelf.drawers
-                if d.start_time
-                and d.duration_minutes is not None
-                and d.duration_minutes > 0
-            ],
-            key=lambda d: (d.start_time, d.sort_order),
+        timed = [
+            drawer
+            for drawer in (shelf.drawers or [])
+            if drawer.start_time is not None
+            and drawer.duration_minutes is not None
+            and drawer.duration_minutes > 0
+        ]
+
+        timed.sort(
+            key=lambda drawer: (
+                drawer.sort_order
+                if drawer.sort_order is not None
+                else 10**9,
+                drawer.start_time,
+                str(drawer.id),
+            )
         )
 
         base_date = shelf.date or datetime.today().date()
 
-        # Build full datetime start/end pairs up front, in the order
-        # the drawers were scheduled within the day. We deliberately do
-        # NOT sort by computed end time here -- sort_order/start_time
-        # reflects the traveler's actual sequence through the day, and
-        # that is what "does A overlap the thing immediately after it"
-        # needs to walk.
-        spans: list[tuple[Any, datetime, datetime]] = []
+        previous_end: datetime | None = None
+        previous_drawer: Any | None = None
 
         for drawer in timed:
-            start_dt = datetime.combine(base_date, drawer.start_time)
-            end_dt = start_dt + timedelta(minutes=drawer.duration_minutes)
-            spans.append((drawer, start_dt, end_dt))
+            start_dt = datetime.combine(
+                base_date,
+                drawer.start_time,
+            )
 
-        for (current, current_start, current_end), (following, following_start, _) in zip(
-            spans, spans[1:]
-        ):
-            # If a later-in-sequence activity's start is technically
-            # "earlier" in clock time only because IT rolled into the
-            # next day too (e.g. two late-night activities both after
-            # midnight), align it forward by a day so the comparison
-            # still reflects real elapsed time rather than clock-face
-            # time. This only fires when the current activity's END
-            # has already crossed midnight relative to its own start.
-            if current_end.date() > current_start.date() and following_start < current_start:
-                following_start = following_start + timedelta(days=1)
+            # Move the current start forward when its clock time belongs
+            # to the next calendar segment of the schedule.
+            #
+            # Example:
+            # previous = 23:00 -> 01:00
+            # current = 00:30
+            #
+            # The 00:30 activity is interpreted as next-day 00:30,
+            # rather than earlier than the 23:00 activity.
+            if previous_end is not None:
+                while start_dt < previous_end:
+                    candidate = start_dt + timedelta(days=1)
 
-            if current_end > following_start:
+                    # Only roll forward when doing so actually moves
+                    # the activity beyond the previous scheduled start.
+                    # This protects against ordinary same-day ordering.
+                    if candidate >= previous_end:
+                        start_dt = candidate
+                        break
+
+                    start_dt = candidate
+
+            end_dt = start_dt + timedelta(
+                minutes=drawer.duration_minutes
+            )
+
+            if previous_end is not None and start_dt < previous_end:
                 issues.append(
                     Footstool(
                         cabinet_id=cabinet.id,
@@ -187,21 +347,21 @@ class ValidationEngine:
                         severity="error",
                         category="time",
                         message=(
-                            f"Day {shelf.day_number}: '{current.name}' "
-                            f"({current_start.strftime('%H:%M')}-"
-                            f"{current_end.strftime('%H:%M')}"
-                            f"{' next day' if current_end.date() > current_start.date() else ''}) "
-                            f"overlaps with '{following.name}' "
-                            f"({following_start.strftime('%H:%M')})."
+                            f"Day {shelf.day_number}: "
+                            f"'{previous_drawer.name}' "
+                            f"overlaps with '{drawer.name}'."
                         ),
                     )
                 )
 
+            previous_end = end_dt
+            previous_drawer = drawer
+
         return issues
 
-    # ------------------------------------------------------------------
-    # ACCOMMODATION -- archetype-aware
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # ACCOMMODATION
+    # ==================================================================
 
     def _check_accommodation_present(
         self,
@@ -214,9 +374,6 @@ class ValidationEngine:
         if shelf.headboards:
             return []
 
-        # A day explicitly marked as NOT requiring overnight
-        # accommodation (e.g. DayArchetype.DEPARTURE) is not an error
-        # just because it has no Headboard.
         if (
             overnight_required is not None
             and shelf.day_number in overnight_required
@@ -230,18 +387,26 @@ class ValidationEngine:
                 shelf_id=shelf.id,
                 severity="error",
                 category="accommodation",
-                message=f"Day {shelf.day_number}: no accommodation assigned for this overnight.",
+                message=(
+                    f"Day {shelf.day_number}: no accommodation "
+                    "assigned for this overnight."
+                ),
             )
         ]
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # FALLBACK ACTIVITY PROVENANCE
-    # ------------------------------------------------------------------
+    # ==================================================================
 
-    def _check_fallback_activities(self, cabinet: Cabinet, shelf: Shelf) -> list[Footstool]:
+    def _check_fallback_activities(
+        self,
+        cabinet: Cabinet,
+        shelf: Shelf,
+    ) -> list[Footstool]:
+
         issues: list[Footstool] = []
 
-        for drawer in shelf.drawers:
+        for drawer in shelf.drawers or []:
             if not getattr(drawer, "is_fallback", False):
                 continue
 
@@ -277,22 +442,186 @@ class ValidationEngine:
 
         return issues
 
-    # ------------------------------------------------------------------
-    # TRANSFER FEASIBILITY
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # SHELF DESTINATION INTEGRITY
+    # ==================================================================
 
-    def _check_transfer_feasibility(self, cabinet: Cabinet) -> list[Footstool]:
+    def _check_shelf_destination_integrity(
+        self,
+        cabinet: Cabinet,
+        shelf: Shelf,
+    ) -> list[Footstool]:
+
         issues: list[Footstool] = []
 
-        for hinge in cabinet.hinges:
+        destination_id = getattr(
+            shelf,
+            "destination_id",
+            None,
+        )
+
+        if not destination_id:
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    shelf_id=shelf.id,
+                    severity="error",
+                    category="route",
+                    message=(
+                        f"Day {shelf.day_number}: shelf has no "
+                        "destination_id."
+                    ),
+                )
+            )
+            return issues
+
+        route_ids = self._normalized_route_ids(cabinet)
+
+        if route_ids and destination_id not in route_ids:
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    shelf_id=shelf.id,
+                    severity="error",
+                    category="route",
+                    message=(
+                        f"Day {shelf.day_number}: shelf references "
+                        "a destination outside the cabinet route."
+                    ),
+                )
+            )
+
+        return issues
+
+    # ==================================================================
+    # DRAWER DESTINATION INTEGRITY
+    # ==================================================================
+
+    def _check_drawer_destination_integrity(
+        self,
+        cabinet: Cabinet,
+        shelf: Shelf,
+    ) -> list[Footstool]:
+
+        issues: list[Footstool] = []
+
+        shelf_destination = getattr(
+            shelf,
+            "destination_id",
+            None,
+        )
+
+        if not shelf_destination:
+            return issues
+
+        for drawer in shelf.drawers or []:
+            drawer_destination = getattr(
+                drawer,
+                "destination_id",
+                None,
+            )
+
+            if not drawer_destination:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        shelf_id=shelf.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            f"Day {shelf.day_number}: activity "
+                            f"'{drawer.name}' has no destination_id."
+                        ),
+                    )
+                )
+                continue
+
+            # A Drawer belongs to the destination represented by its
+            # Shelf. Transfer drawers are also required to use the
+            # destination represented by that day; the Hinge carries
+            # the actual from/to transition separately.
+            if drawer_destination != shelf_destination:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        shelf_id=shelf.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            f"Day {shelf.day_number}: activity "
+                            f"'{drawer.name}' references a destination "
+                            "different from the day's shelf destination."
+                        ),
+                    )
+                )
+
+        return issues
+
+    # ==================================================================
+    # DAY KIND
+    # ==================================================================
+
+    def _check_day_kind_integrity(
+        self,
+        cabinet: Cabinet,
+        shelf: Shelf,
+    ) -> list[Footstool]:
+
+        issues: list[Footstool] = []
+
+        day_kind = getattr(
+            shelf,
+            "day_kind",
+            None,
+        )
+
+        if day_kind is None:
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    shelf_id=shelf.id,
+                    severity="error",
+                    category="route",
+                    message=(
+                        f"Day {shelf.day_number}: day_kind is missing."
+                    ),
+                )
+            )
+            return issues
+
+        normalized = str(day_kind).upper()
+
+        if normalized not in self.VALID_DAY_KINDS:
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    shelf_id=shelf.id,
+                    severity="error",
+                    category="route",
+                    message=(
+                        f"Day {shelf.day_number}: unsupported day_kind "
+                        f"'{day_kind}'. Expected STANDARD or TRANSIT."
+                    ),
+                )
+            )
+
+        return issues
+
+    # ==================================================================
+    # TRANSFER FEASIBILITY
+    # ==================================================================
+
+    def _check_transfer_feasibility(
+        self,
+        cabinet: Cabinet,
+    ) -> list[Footstool]:
+
+        issues: list[Footstool] = []
+
+        for hinge in cabinet.hinges or []:
             duration = hinge.duration_minutes
 
             if duration is None:
-                # route_geography.py may honestly report an unavailable
-                # duration rather than fabricate one. That is not a
-                # feasibility violation -- it's missing data -- so it
-                # gets a warning, not an error, and does not go through
-                # the numeric threshold checks below.
                 issues.append(
                     Footstool(
                         cabinet_id=cabinet.id,
@@ -302,6 +631,20 @@ class ValidationEngine:
                             "A transfer has no known duration. Route "
                             "data is unavailable for this leg and "
                             "should be confirmed before booking."
+                        ),
+                    )
+                )
+                continue
+
+            if duration < 0:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        severity="error",
+                        category="transport",
+                        message=(
+                            f"Transfer of {duration} minutes has an "
+                            "invalid negative duration."
                         ),
                     )
                 )
@@ -333,7 +676,13 @@ class ValidationEngine:
                     )
                 )
 
-            if hinge.source in {
+            source = getattr(
+                hinge,
+                "source",
+                None,
+            )
+
+            if source in {
                 "fallback_estimate",
                 "fallback_inter_country_estimate",
                 "coordinate_estimate",
@@ -346,25 +695,37 @@ class ValidationEngine:
                         message=(
                             "A transfer uses an estimate rather than "
                             "measured route data "
-                            f"(source: {hinge.source})."
+                            f"(source: {source})."
                         ),
                     )
                 )
 
         return issues
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # BORDER CROSSINGS
-    # ------------------------------------------------------------------
+    # ==================================================================
 
-    def _check_border_crossings(self, cabinet: Cabinet) -> list[Footstool]:
+    def _check_border_crossings(
+        self,
+        cabinet: Cabinet,
+    ) -> list[Footstool]:
+
         issues: list[Footstool] = []
 
-        for hinge in cabinet.hinges:
-            if not getattr(hinge, "is_inter_country", False):
+        for hinge in cabinet.hinges or []:
+            if not getattr(
+                hinge,
+                "is_inter_country",
+                False,
+            ):
                 continue
 
-            border_crossing_id = getattr(hinge, "border_crossing_id", None)
+            border_crossing_id = getattr(
+                hinge,
+                "border_crossing_id",
+                None,
+            )
 
             if not border_crossing_id:
                 issues.append(
@@ -390,7 +751,9 @@ class ValidationEngine:
                     WHERE id = CAST(:id AS uuid)
                     """
                 ),
-                {"id": border_crossing_id},
+                {
+                    "id": border_crossing_id,
+                },
             ).fetchone()
 
             if not row:
@@ -400,8 +763,9 @@ class ValidationEngine:
                         severity="warning",
                         category="border",
                         message=(
-                            "The itinerary references a border-crossing "
-                            "record that could not be loaded."
+                            "The itinerary references a "
+                            "border-crossing record that could not "
+                            "be loaded."
                         ),
                     )
                 )
@@ -409,7 +773,10 @@ class ValidationEngine:
 
             name, status, visa_notes = row
 
-            if status in {"closed", "restricted"}:
+            if status in {
+                "closed",
+                "restricted",
+            }:
                 issues.append(
                     Footstool(
                         cabinet_id=cabinet.id,
@@ -422,10 +789,16 @@ class ValidationEngine:
                         ),
                     )
                 )
+
             elif status == "e_visa_required":
-                message = f"Crossing at {name} requires an e-visa arranged in advance."
+                message = (
+                    f"Crossing at {name} requires an e-visa "
+                    "arranged in advance."
+                )
+
                 if visa_notes:
                     message += f" {visa_notes}"
+
                 issues.append(
                     Footstool(
                         cabinet_id=cabinet.id,
@@ -434,18 +807,15 @@ class ValidationEngine:
                         message=message,
                     )
                 )
+
             elif status == "visa_on_arrival":
-                # FIX (real-schema alignment): doc 18's border_status
-                # enum has a fifth value, visa_on_arrival, that was
-                # previously unhandled -- it fell through both branches
-                # silently (correctly not an error, but also silently
-                # not surfaced as useful information either). This is
-                # a genuinely helpful fact for a traveler to know in
-                # advance, so it now generates an informational note
-                # rather than staying invisible.
-                message = f"Crossing at {name} offers visa on arrival."
+                message = (
+                    f"Crossing at {name} offers visa on arrival."
+                )
+
                 if visa_notes:
                     message += f" {visa_notes}"
+
                 issues.append(
                     Footstool(
                         cabinet_id=cabinet.id,
@@ -457,16 +827,22 @@ class ValidationEngine:
 
         return issues
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # ROUTE INTEGRITY
-    # ------------------------------------------------------------------
+    # ==================================================================
 
-    def _check_route_integrity(self, cabinet: Cabinet) -> list[Footstool]:
+    def _check_route_integrity(
+        self,
+        cabinet: Cabinet,
+    ) -> list[Footstool]:
+
         issues: list[Footstool] = []
 
-        destination_ids = list(cabinet.route_destination_ids or [])
+        route_ids = list(
+            cabinet.route_destination_ids or []
+        )
 
-        if not destination_ids:
+        if not route_ids:
             issues.append(
                 Footstool(
                     cabinet_id=cabinet.id,
@@ -477,7 +853,47 @@ class ValidationEngine:
             )
             return issues
 
-        shelf_destinations = [s.destination_id for s in cabinet.shelves if s.destination_id]
+        shelves = sorted(
+            list(cabinet.shelves or []),
+            key=lambda shelf: (
+                shelf.day_number
+                if shelf.day_number is not None
+                else 10**9,
+                str(shelf.id),
+            ),
+        )
+
+        if not shelves:
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    severity="error",
+                    category="route",
+                    message="Cabinet contains no itinerary days.",
+                )
+            )
+            return issues
+
+        expected_days = cabinet.duration_days or 0
+
+        if len(shelves) != expected_days:
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    severity="error",
+                    category="duration",
+                    message=(
+                        f"Cabinet declares {expected_days} days but "
+                        f"contains {len(shelves)} persisted shelves."
+                    ),
+                )
+            )
+
+        shelf_destinations = [
+            shelf.destination_id
+            for shelf in shelves
+            if getattr(shelf, "destination_id", None)
+        ]
 
         if not shelf_destinations:
             issues.append(
@@ -485,12 +901,22 @@ class ValidationEngine:
                     cabinet_id=cabinet.id,
                     severity="error",
                     category="route",
-                    message="Cabinet contains no destination-linked days.",
+                    message=(
+                        "Cabinet contains no destination-linked days."
+                    ),
                 )
             )
             return issues
 
-        invalid_destinations = [d for d in shelf_destinations if d not in destination_ids]
+        # --------------------------------------------------------------
+        # Membership
+        # --------------------------------------------------------------
+
+        invalid_destinations = [
+            destination_id
+            for destination_id in shelf_destinations
+            if destination_id not in route_ids
+        ]
 
         if invalid_destinations:
             issues.append(
@@ -505,38 +931,749 @@ class ValidationEngine:
                 )
             )
 
-        expected_days = cabinet.duration_days or 0
+        # --------------------------------------------------------------
+        # Exact geographic sequence.
+        #
+        # Consecutive duplicates represent multiple days in one place.
+        # Non-consecutive repeats remain meaningful:
+        #
+        # A -> B -> A
+        #
+        # must remain:
+        #
+        # A -> B -> A
+        #
+        # and must never be reduced to A -> B.
+        # --------------------------------------------------------------
 
-        if len(cabinet.shelves) != expected_days:
+        expected_sequence = self._compress_consecutive(route_ids)
+        actual_sequence = self._compress_consecutive(
+            shelf_destinations
+        )
+
+        if actual_sequence != expected_sequence:
             issues.append(
                 Footstool(
                     cabinet_id=cabinet.id,
                     severity="error",
-                    category="duration",
+                    category="route",
                     message=(
-                        f"Cabinet declares {expected_days} days but "
-                        f"contains {len(cabinet.shelves)} persisted shelves."
+                        "Persisted itinerary destination sequence does "
+                        "not match the cabinet route order. "
+                        f"Expected {self._format_ids(expected_sequence)} "
+                        f"but found {self._format_ids(actual_sequence)}."
+                    ),
+                )
+            )
+
+        # --------------------------------------------------------------
+        # Warn about genuine non-consecutive repetition/backtracking.
+        #
+        # This is NOT an error. A -> B -> A can be intentional.
+        # The validator only makes it visible rather than silently
+        # pretending the route is linear.
+        # --------------------------------------------------------------
+
+        if self._has_non_consecutive_repeat(expected_sequence):
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    severity="warning",
+                    category="route",
+                    message=(
+                        "The requested route contains a non-consecutive "
+                        "destination repeat/backtrack. The route order "
+                        "has been preserved exactly and should be "
+                        "confirmed by the traveler before booking."
                     ),
                 )
             )
 
         return issues
 
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # HINGE / ROUTE-LEG INTEGRITY
+    # ==================================================================
+
+    def _check_hinge_integrity(
+        self,
+        cabinet: Cabinet,
+    ) -> list[Footstool]:
+
+        issues: list[Footstool] = []
+
+        route = self._normalized_route_ids(cabinet)
+
+        if len(route) < 2:
+            if cabinet.hinges:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            "Cabinet contains route legs even though "
+                            "the route has fewer than two destinations."
+                        ),
+                    )
+                )
+            return issues
+
+        hinges = sorted(
+            list(cabinet.hinges or []),
+            key=lambda hinge: (
+                hinge.sequence_order
+                if hinge.sequence_order is not None
+                else 10**9,
+                str(hinge.id),
+            ),
+        )
+
+        expected_leg_count = len(route) - 1
+
+        if len(hinges) != expected_leg_count:
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    severity="error",
+                    category="route",
+                    message=(
+                        f"Route contains {len(hinges)} persisted "
+                        f"transfer legs but {expected_leg_count} "
+                        "are required for the ordered destination route."
+                    ),
+                )
+            )
+
+        comparable_count = min(
+            len(hinges),
+            expected_leg_count,
+        )
+
+        for index in range(comparable_count):
+            hinge = hinges[index]
+
+            expected_from = route[index]
+            expected_to = route[index + 1]
+
+            actual_from = getattr(
+                hinge,
+                "from_destination_id",
+                None,
+            )
+            actual_to = getattr(
+                hinge,
+                "to_destination_id",
+                None,
+            )
+
+            if actual_from != expected_from:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            f"Route leg {index + 1} starts at the "
+                            "wrong destination. "
+                            f"Expected {expected_from}, "
+                            f"found {actual_from}."
+                        ),
+                    )
+                )
+
+            if actual_to != expected_to:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            f"Route leg {index + 1} ends at the "
+                            "wrong destination. "
+                            f"Expected {expected_to}, "
+                            f"found {actual_to}."
+                        ),
+                    )
+                )
+
+            if index > 0:
+                previous = hinges[index - 1]
+
+                previous_to = getattr(
+                    previous,
+                    "to_destination_id",
+                    None,
+                )
+
+                if actual_from != previous_to:
+                    issues.append(
+                        Footstool(
+                            cabinet_id=cabinet.id,
+                            severity="error",
+                            category="route",
+                            message=(
+                                f"Route legs are discontinuous between "
+                                f"legs {index} and {index + 1}. "
+                                "The next leg does not start where the "
+                                "previous leg ends."
+                            ),
+                        )
+                    )
+
+        # Sequence numbers themselves should describe an ordered route.
+        sequence_values = [
+            getattr(
+                hinge,
+                "sequence_order",
+                None,
+            )
+            for hinge in hinges
+        ]
+
+        if any(
+            value is None
+            for value in sequence_values
+        ):
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    severity="error",
+                    category="route",
+                    message=(
+                        "One or more route legs have no "
+                        "sequence_order."
+                    ),
+                )
+            )
+        elif sequence_values != list(
+            range(1, len(sequence_values) + 1)
+        ):
+            issues.append(
+                Footstool(
+                    cabinet_id=cabinet.id,
+                    severity="error",
+                    category="route",
+                    message=(
+                        "Route leg sequence_order values are not "
+                        "a continuous ordered sequence."
+                    ),
+                )
+            )
+
+        return issues
+
+    # ==================================================================
+    # DESTINATION TRANSITION INTEGRITY
+    # ==================================================================
+
+    def _check_destination_transition_integrity(
+        self,
+        cabinet: Cabinet,
+    ) -> list[Footstool]:
+
+        issues: list[Footstool] = []
+
+        shelves = sorted(
+            list(cabinet.shelves or []),
+            key=lambda shelf: (
+                shelf.day_number
+                if shelf.day_number is not None
+                else 10**9,
+                str(shelf.id),
+            ),
+        )
+
+        if len(shelves) < 2:
+            return issues
+
+        route = self._normalized_route_ids(cabinet)
+
+        if len(route) < 2:
+            return issues
+
+        hinges = sorted(
+            list(cabinet.hinges or []),
+            key=lambda hinge: (
+                hinge.sequence_order
+                if hinge.sequence_order is not None
+                else 10**9,
+                str(hinge.id),
+            ),
+        )
+
+        # Only compare geographic destination changes between calendar
+        # days. Multiple consecutive days at the same destination are
+        # normal and require no transfer.
+        previous_destination = getattr(
+            shelves[0],
+            "destination_id",
+            None,
+        )
+
+        hinge_by_pair = {
+            (
+                getattr(
+                    hinge,
+                    "from_destination_id",
+                    None,
+                ),
+                getattr(
+                    hinge,
+                    "to_destination_id",
+                    None,
+                ),
+            ): hinge
+            for hinge in hinges
+        }
+
+        for shelf in shelves[1:]:
+            current_destination = getattr(
+                shelf,
+                "destination_id",
+                None,
+            )
+
+            if not previous_destination or not current_destination:
+                previous_destination = current_destination
+                continue
+
+            if current_destination == previous_destination:
+                previous_destination = current_destination
+                continue
+
+            if (
+                previous_destination,
+                current_destination,
+            ) not in hinge_by_pair:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        shelf_id=shelf.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            f"Day {shelf.day_number}: itinerary moves "
+                            f"from destination {previous_destination} "
+                            f"to {current_destination}, but no matching "
+                            "persisted route leg exists."
+                        ),
+                    )
+                )
+
+            previous_destination = current_destination
+
+        return issues
+
+    # ==================================================================
+    # TRANSIT DAY INTEGRITY
+    # ==================================================================
+
+    def _check_transit_day_integrity(
+        self,
+        cabinet: Cabinet,
+    ) -> list[Footstool]:
+
+        issues: list[Footstool] = []
+
+        shelves = sorted(
+            list(cabinet.shelves or []),
+            key=lambda shelf: (
+                shelf.day_number
+                if shelf.day_number is not None
+                else 10**9,
+                str(shelf.id),
+            ),
+        )
+
+        hinges = sorted(
+            list(cabinet.hinges or []),
+            key=lambda hinge: (
+                hinge.sequence_order
+                if hinge.sequence_order is not None
+                else 10**9,
+                str(hinge.id),
+            ),
+        )
+
+        if not shelves:
+            return issues
+
+        hinge_pairs = {
+            (
+                getattr(
+                    hinge,
+                    "from_destination_id",
+                    None,
+                ),
+                getattr(
+                    hinge,
+                    "to_destination_id",
+                    None,
+                ),
+            )
+            for hinge in hinges
+        }
+
+        for index, shelf in enumerate(shelves):
+            day_kind = str(
+                getattr(
+                    shelf,
+                    "day_kind",
+                    "",
+                )
+            ).upper()
+
+            if day_kind != "TRANSIT":
+                continue
+
+            current_destination = getattr(
+                shelf,
+                "destination_id",
+                None,
+            )
+
+            if not current_destination:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        shelf_id=shelf.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            f"Day {shelf.day_number}: TRANSIT day "
+                            "has no destination_id."
+                        ),
+                    )
+                )
+                continue
+
+            # A transit day represents an actual route transition.
+            # It therefore needs an identifiable preceding destination
+            # unless this is a special first-day construction. We do not
+            # invent an airport/gateway destination here.
+            if index == 0:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        shelf_id=shelf.id,
+                        severity="warning",
+                        category="route",
+                        message=(
+                            f"Day {shelf.day_number} is marked TRANSIT "
+                            "but is the first persisted itinerary day. "
+                            "Confirm that the day classification "
+                            "represents the actual arrival/transition "
+                            "semantics."
+                        ),
+                    )
+                )
+                continue
+
+            previous_shelf = shelves[index - 1]
+
+            previous_destination = getattr(
+                previous_shelf,
+                "destination_id",
+                None,
+            )
+
+            if not previous_destination:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        shelf_id=shelf.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            f"Day {shelf.day_number}: TRANSIT day "
+                            "follows a day without a destination."
+                        ),
+                    )
+                )
+                continue
+
+            if previous_destination == current_destination:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        shelf_id=shelf.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            f"Day {shelf.day_number}: day is marked "
+                            "TRANSIT but the previous and current "
+                            "days have the same destination."
+                        ),
+                    )
+                )
+                continue
+
+            if (
+                previous_destination,
+                current_destination,
+            ) not in hinge_pairs:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        shelf_id=shelf.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            f"Day {shelf.day_number}: TRANSIT day "
+                            "does not correspond to a persisted "
+                            "route transition from the previous "
+                            "destination to the current destination."
+                        ),
+                    )
+                )
+
+        return issues
+
+    # ==================================================================
+    # USER REQUESTED ROUTE PRESERVATION
+    # ==================================================================
+
+    def _check_requested_route_preservation(
+        self,
+        cabinet: Cabinet,
+    ) -> list[Footstool]:
+
+        issues: list[Footstool] = []
+
+        request_json = getattr(
+            cabinet,
+            "request_json",
+            None,
+        )
+
+        if not isinstance(request_json, Mapping):
+            return issues
+
+        requested = request_json.get("destinations")
+
+        if not isinstance(requested, Sequence) or isinstance(
+            requested,
+            (str, bytes),
+        ):
+            return issues
+
+        requested_ids = [
+            value
+            for value in requested
+            if value not in (None, "")
+        ]
+
+        if not requested_ids:
+            return issues
+
+        final_route = list(
+            cabinet.route_destination_ids or []
+        )
+
+        # Only perform a hard equality comparison when the identifiers
+        # are directly comparable. This avoids falsely reporting a
+        # mismatch when request_json stores destination slugs/names while
+        # route_destination_ids stores UUIDs.
+        if self._identifiers_are_comparable(
+            requested_ids,
+            final_route,
+        ):
+            requested_sequence = self._compress_consecutive(
+                requested_ids
+            )
+            final_sequence = self._compress_consecutive(
+                final_route
+            )
+
+            if requested_sequence != final_sequence:
+                issues.append(
+                    Footstool(
+                        cabinet_id=cabinet.id,
+                        severity="error",
+                        category="route",
+                        message=(
+                            "The persisted final route does not preserve "
+                            "the destination order requested by the user."
+                        ),
+                    )
+                )
+
+        return issues
+
+    # ==================================================================
     # ALLOCATION WARNINGS
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     def _check_allocation_warnings(
-        self, cabinet: Cabinet, extra_warnings: list[str]
+        self,
+        cabinet: Cabinet,
+        extra_warnings: list[str],
     ) -> list[Footstool]:
+
         return [
             Footstool(
                 cabinet_id=cabinet.id,
                 severity="warning",
                 category="allocation",
-                message=msg,
+                message=message,
             )
-            for msg in extra_warnings
-            if msg
+            for message in extra_warnings
+            if message
         ]
 
+    # ==================================================================
+    # HELPERS
+    # ==================================================================
+
+    @staticmethod
+    def _compress_consecutive(
+        values: Sequence[Any],
+    ) -> list[Any]:
+        """
+        Remove only consecutive duplicates.
+
+        IMPORTANT:
+
+            A -> B -> A
+
+        remains:
+
+            A -> B -> A
+
+        while:
+
+            A -> A -> B
+
+        becomes:
+
+            A -> B
+        """
+
+        result: list[Any] = []
+
+        for value in values:
+            if value in (None, ""):
+                continue
+
+            if not result or result[-1] != value:
+                result.append(value)
+
+        return result
+
+    @staticmethod
+    def _normalized_route_ids(
+        cabinet: Cabinet,
+    ) -> list[Any]:
+        return ValidationEngine._compress_consecutive(
+            list(cabinet.route_destination_ids or [])
+        )
+
+    @staticmethod
+    def _has_non_consecutive_repeat(
+        values: Sequence[Any],
+    ) -> bool:
+        seen: set[Any] = set()
+
+        for value in values:
+            try:
+                if value in seen:
+                    return True
+                seen.add(value)
+            except TypeError:
+                # UUID/string IDs should normally be hashable. If a
+                # caller supplies an unusual unhashable representation,
+                # simply skip the quality warning rather than failing
+                # the entire validator.
+                continue
+
+        return False
+
+    @staticmethod
+    def _identifiers_are_comparable(
+        requested: Sequence[Any],
+        final: Sequence[Any],
+    ) -> bool:
+        """
+        Determine whether request_json destination identifiers can be
+        compared directly to route_destination_ids.
+
+        We intentionally avoid assuming whether the request stores UUIDs,
+        slugs, or names.
+        """
+
+        if not requested or not final:
+            return False
+
+        requested_types = {
+            type(value)
+            for value in requested
+            if value not in (None, "")
+        }
+
+        final_types = {
+            type(value)
+            for value in final
+            if value not in (None, "")
+        }
+
+        if requested_types == final_types:
+            return True
+
+        # UUID values can arrive as strings in request_json and as UUID
+        # objects in SQLAlchemy models. Convert both to their textual form
+        # only when the representations clearly look UUID-like.
+        def looks_uuid(value: Any) -> bool:
+            text_value = str(value)
+
+            return (
+                len(text_value) == 36
+                and text_value.count("-") == 4
+            )
+
+        requested_uuid_like = all(
+            looks_uuid(value)
+            for value in requested
+            if value not in (None, "")
+        )
+
+        final_uuid_like = all(
+            looks_uuid(value)
+            for value in final
+            if value not in (None, "")
+        )
+
+        return requested_uuid_like and final_uuid_like
+
+    @staticmethod
+    def _format_ids(
+        values: Sequence[Any],
+    ) -> str:
+        return "[" + ", ".join(
+            str(value)
+            for value in values
+        ) + "]"
+
+    @staticmethod
+    def _deduplicate_issues(
+        issues: list[Footstool],
+    ) -> list[Footstool]:
+
+        result: list[Footstool] = []
+        seen: set[tuple[Any, ...]] = set()
+
+        for issue in issues:
+            key = (
+                getattr(issue, "severity", None),
+                getattr(issue, "category", None),
+                getattr(issue, "shelf_id", None),
+                getattr(issue, "message", None),
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result.append(issue)
+
+        return result
