@@ -1,6 +1,6 @@
 """
-ItineraryPlanningEngine v4
----------------------------
+ItineraryPlanningEngine
+-----------------------
 
 Production itinerary builder for the persisted furniture schema.
 
@@ -32,27 +32,27 @@ It receives:
     - day_archetypes
     - route_facts
 
-RouteGeographyEngine is the authoritative source for:
+RouteGeographyEngine is authoritative for:
     - route order
     - route duration
-    - transport mode
+    - route transport mode
     - inter-country status
     - border-crossing facts
     - route source
 
-The planning engine does not independently invent or reconstruct
-inter-destination transport facts.
-
 No-fabrication rules
 --------------------
-- Route order is authoritative.
-- Real drive/flight duration is preferred.
-- Unknown route duration remains unknown in the displayed description.
-- Internal fallback duration may be used for scheduling only and is
-  marked as fallback.
-- No invented attraction names are generated from database-free facts.
+- Preserve the route order supplied by the orchestrator.
+- Never globally deduplicate destination IDs.
+- Real route duration is preferred.
+- Unknown route duration remains unknown in displayed text.
+- Internal fallback durations are for scheduling only and are marked
+  as fallback.
+- Never invent airport names, airport transfers, attraction names,
+  flight modes, drive modes, lodge names, or route durations.
 - Only game-drive drawers receive absolute clock times.
-- All other drawers use duration_minutes + sort_order.
+- Other drawers use duration_minutes + sort_order.
+- Destination transitions and transit days are distinct concepts.
 - Transit classification comes from the orchestrator.
 """
 
@@ -86,11 +86,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_GAME_DRIVE_START = dt_time(6, 0)
 EVENING_GAME_DRIVE_START = dt_time(16, 0)
 
-DRIVE_TO_FLIGHT_THRESHOLD_MINUTES = 6 * 60
-
+# These are NOT route facts. They exist only so the furniture scheduler
+# has a finite duration where the database contains no duration.
+# The displayed description must continue to say that the duration
+# is unavailable.
 FALLBACK_ARRIVAL_TRANSFER_MINUTES = 60
 FALLBACK_DEPARTURE_TRANSFER_MINUTES = 60
 FALLBACK_TRANSIT_LEG_MINUTES = 60
+
+FALLBACK_ACTIVITY_DURATION_MINUTES = 120
+FALLBACK_MORNING_ACTIVITY_MINUTES = 240
+FALLBACK_AFTERNOON_ACTIVITY_MINUTES = 150
 
 
 try:
@@ -253,109 +259,110 @@ FALLBACK_VARIANTS: dict[str, list[tuple[str, str]]] = {
     "island": [
         (
             "Beach & relaxation",
-            "Free time at the lodge's beach area — no specific excursion "
-            "booked; the operator will offer what suits sea conditions.",
+            "Free time at the destination. No specific excursion "
+            "is booked for this slot.",
         ),
         (
             "Shoreline time",
-            "Open beach time at the lodge — no guided excursion booked "
+            "Open beach time. No guided excursion is booked "
             "for this slot.",
         ),
     ],
     "beach": [
         (
             "Beach & relaxation",
-            "Free time at the lodge's beach area — no specific excursion "
-            "booked; the operator will offer what suits sea conditions.",
+            "Free time at the destination. No specific excursion "
+            "is booked for this slot.",
         ),
         (
             "Shoreline time",
-            "Unstructured time along the beach — no guided activity "
-            "booked for this slot.",
+            "Unstructured time along the beach. No guided activity "
+            "is booked for this slot.",
         ),
     ],
     "mountain": [
         (
             "Acclimatisation time",
-            "Time to acclimatise at a comfortable pace — no summit attempt "
-            "is scheduled for this slot.",
+            "Time to acclimatise at a comfortable pace. No summit "
+            "attempt is scheduled.",
         ),
         (
             "Rest & recovery",
-            "Open time at camp to rest and recover.",
+            "Open time to rest and recover at the accommodation.",
         ),
     ],
     "desert": [
         (
             "Desert nature time",
-            "Open time suited to the surrounding terrain — no specific "
+            "Open time suited to the surrounding terrain. No specific "
             "site is booked for this slot.",
         ),
         (
             "Open camp time",
-            "Unstructured time at camp — no specific excursion booked.",
+            "Unstructured time at the accommodation. No specific "
+            "excursion is booked.",
         ),
     ],
     "marine_park": [
         (
             "Shore time",
-            "Open time at the lodge — optional water-based excursions may "
-            "be offered if conditions allow.",
+            "Open time at the destination. Optional water-based "
+            "activities may depend on conditions.",
         ),
     ],
     "city": [
         (
             "Local exploration time",
-            "Open time for local exploration — no specific venue is "
-            "booked in advance.",
+            "Open time for local exploration. No specific venue "
+            "is booked in advance.",
         ),
         (
             "Free time to explore",
-            "Unstructured time to explore independently — no guided "
-            "activity booked for this slot.",
+            "Unstructured time to explore independently. No guided "
+            "activity is booked.",
         ),
     ],
     "cultural_site": [
         (
             "Cultural exploration time",
-            "Open time around the destination — no specific additional "
-            "venue is booked in advance.",
+            "Open time around the destination. No additional venue "
+            "is booked in advance.",
         ),
     ],
     "unesco_site": [
         (
             "Heritage exploration time",
-            "Open time around the destination — no specific additional "
-            "venue is booked in advance.",
+            "Open time around the destination. No additional venue "
+            "is booked in advance.",
         ),
     ],
     "national_park": [
         (
             "Guided wilderness drive",
-            "Game drive on lodge circuits — no specific route booked in "
-            "advance. Times may shift with conditions.",
+            "Game drive on available lodge circuits. No specific "
+            "route is booked in advance.",
         ),
         (
             "Photographic drive",
-            "A slower-paced drive focused on photography opportunities — "
-            "no specific route booked in advance.",
+            "A slower-paced drive focused on photography opportunities. "
+            "No specific route is booked in advance.",
         ),
         (
             "Bush walk near camp",
-            "Short guided walk near the lodge grounds, conditions "
-            "permitting — no specific route booked in advance.",
+            "Short guided walk near the accommodation, conditions "
+            "permitting. No specific route is booked in advance.",
         ),
     ],
     "game_reserve": [
         (
             "Guided wilderness drive",
-            "Game drive on lodge circuits — no specific route booked in "
-            "advance. Times may shift with conditions.",
+            "Game drive on available lodge circuits. No specific "
+            "route is booked in advance.",
         ),
         (
             "Photographic drive",
-            "A slower-paced drive focused on photography opportunities — "
-            "no specific route booked in advance.",
+            "A slower-paced drive focused on photography opportunities. "
+            "No specific route is booked in advance.",
         ),
     ],
 }
@@ -363,9 +370,9 @@ FALLBACK_VARIANTS: dict[str, list[tuple[str, str]]] = {
 
 _DEFAULT_FALLBACK = [
     (
-        "Time at the lodge",
-        "Open time at the lodge — operator will offer what suits the "
-        "day's conditions.",
+        "Time at the destination",
+        "Open time at the destination. No specific excursion "
+        "is booked for this slot.",
     ),
 ]
 
@@ -384,11 +391,13 @@ class BuildResult:
 # GENERAL HELPERS
 # ---------------------------------------------------------------------
 
-def _is_game_drive_category(category: str | None) -> bool:
+def _is_game_drive_category(
+    category: str | None,
+) -> bool:
     """
     Absolute clock times are intentionally restricted to game drives.
     """
-    return str(category or "").lower() == "game_drive"
+    return str(category or "").strip().lower() == "game_drive"
 
 
 def _fallback_drawer_text(
@@ -398,8 +407,7 @@ def _fallback_drawer_text(
 
     variants = (
         FALLBACK_VARIANTS.get(
-            destination_type or "",
-            _DEFAULT_FALLBACK,
+            str(destination_type or "").lower(),
         )
         or _DEFAULT_FALLBACK
     )
@@ -420,11 +428,14 @@ def _merged_ranked_categories(
     tags: list[str] = []
 
     if focus:
-        tags.append(str(focus).lower())
+        tags.append(
+            str(focus).strip().lower()
+        )
 
     tags.extend(
-        str(style).lower()
+        str(style).strip().lower()
         for style in travel_style
+        if style
     )
 
     for tag in tags:
@@ -438,7 +449,7 @@ def _merged_ranked_categories(
 
     if destination_type:
         for category in DESTINATION_TYPE_CATEGORY_RANKS.get(
-            str(destination_type).lower(),
+            str(destination_type).strip().lower(),
             [],
         ):
             if category not in seen:
@@ -453,13 +464,23 @@ def _format_transfer_description(
     minutes: int | None,
 ) -> str:
 
+    normalized_mode = (
+        str(mode).strip().lower()
+        if mode
+        else None
+    )
+
     mode_label = {
         "scheduled_flight": "Scheduled flight",
         "charter_flight": "Charter flight",
         "private_4x4": "Private 4x4",
         "road_transfer": "Road transfer",
+        "drive": "Road transfer",
+        "road": "Road transfer",
+        "flight": "Flight",
+        "ferry": "Ferry",
     }.get(
-        mode or "private_4x4",
+        normalized_mode,
         "Transfer",
     )
 
@@ -512,9 +533,7 @@ def _is_cultural_archetype(
     value: Any,
 ) -> bool:
 
-    normalized = _normalise_archetype(value)
-
-    return normalized in {
+    return _normalise_archetype(value) in {
         "cultural",
         "culture",
         "cultural_day",
@@ -597,15 +616,22 @@ class ItineraryPlanningEngine:
 
         travel_style = list(
             dict.fromkeys(
-                str(style).lower()
+                str(style).strip().lower()
                 for style in travel_style
                 if style
             )
         )
 
-        focus = request.get(
-            "focus",
-            "wildlife",
+        # IMPORTANT:
+        # Do not silently force wildlife when the caller did not
+        # specify a focus. The Rules/UI/orchestrator layer owns
+        # request defaults.
+        focus_raw = request.get("focus")
+
+        focus = (
+            str(focus_raw).strip().lower()
+            if focus_raw
+            else None
         )
 
         budget_tier = str(
@@ -613,13 +639,13 @@ class ItineraryPlanningEngine:
                 "budget_tier",
                 "mid",
             )
-        ).lower()
+        ).strip().lower()
 
         start_date_raw = request.get(
             "start_date"
         )
 
-        start_date = None
+        start_date: date | None = None
 
         if start_date_raw:
             try:
@@ -635,48 +661,39 @@ class ItineraryPlanningEngine:
                 )
             except ValueError as exc:
                 raise ValueError(
-                    f"Invalid start_date: "
-                    f"{start_date_raw}"
+                    f"Invalid start_date: {start_date_raw}"
                 ) from exc
 
         if not destination_ids:
             raise ValueError(
-                "Itinerary generation requires "
-                "at least one destination."
+                "Itinerary generation requires at least "
+                "one destination."
             )
 
-        cleaned_destination_ids = list(
-            dict.fromkeys(
-                str(destination_id)
-                for destination_id in destination_ids
-                if destination_id
+        destination_ids = (
+            self._normalize_destination_ids(
+                destination_ids
             )
         )
 
-        if not cleaned_destination_ids:
+        if not destination_ids:
             raise ValueError(
                 "No valid destination IDs were supplied."
             )
 
-        if len(cleaned_destination_ids) > days:
+        if len(destination_ids) > days:
             raise ValueError(
                 "Effective destination count exceeds "
-                "available trip days. Route feasibility "
-                "must reduce the destination list before "
+                "available trip days. Route feasibility must "
+                "reduce the destination list before "
                 "ItineraryPlanningEngine.build()."
             )
 
-        destination_ids = (
-            cleaned_destination_ids
-        )
-
-        if len(day_allocation) != len(
-            destination_ids
-        ):
+        if len(day_allocation) != len(destination_ids):
             raise ValueError(
                 "day_allocation length "
                 f"({len(day_allocation)}) does not match "
-                f"destination_ids length "
+                "destination_ids length "
                 f"({len(destination_ids)})."
             )
 
@@ -693,9 +710,9 @@ class ItineraryPlanningEngine:
 
         if sum(normalized_allocation) != days:
             raise ValueError(
-                "day_allocation must account for the "
-                f"full requested trip duration. "
-                f"Expected {days} days but received "
+                "day_allocation must account for the full "
+                f"requested trip duration. Expected {days} "
+                f"days but received "
                 f"{sum(normalized_allocation)}."
             )
 
@@ -708,19 +725,9 @@ class ItineraryPlanningEngine:
                 "at least one allocated day."
             )
 
-        day_allocation = normalized_allocation
-
-        transit_days = (
-            transit_days or {}
-        )
-
-        day_archetypes = (
-            day_archetypes or {}
-        )
-
-        route_facts = (
-            route_facts or []
-        )
+        transit_days = transit_days or {}
+        day_archetypes = day_archetypes or {}
+        route_facts = route_facts or []
 
         cabinet = Cabinet(
             request_json=request,
@@ -742,18 +749,12 @@ class ItineraryPlanningEngine:
             start_date=start_date,
             end_date=(
                 start_date
-                + timedelta(
-                    days=days - 1
-                )
+                + timedelta(days=days - 1)
                 if start_date
                 else None
             ),
-            primary_destination_id=(
-                destination_ids[0]
-            ),
-            route_destination_ids=(
-                destination_ids
-            ),
+            primary_destination_id=destination_ids[0],
+            route_destination_ids=destination_ids,
         )
 
         self.db.add(cabinet)
@@ -778,41 +779,25 @@ class ItineraryPlanningEngine:
                 + ", ".join(missing_meta)
             )
 
-        if hasattr(
-            cabinet,
-            "route_countries",
-        ):
-            countries = [
-                meta[destination_id].get(
-                    "country"
-                )
-                for destination_id
-                in destination_ids
-                if meta.get(
-                    destination_id,
-                    {},
-                ).get("country")
-            ]
+        countries = [
+            meta[destination_id].get("country")
+            for destination_id in destination_ids
+            if meta.get(destination_id, {}).get("country")
+        ]
 
+        if hasattr(cabinet, "route_countries"):
             cabinet.route_countries = list(
                 dict.fromkeys(countries)
             )
 
-        if hasattr(
-            cabinet,
-            "primary_country",
-        ):
+        if hasattr(cabinet, "primary_country"):
             cabinet.primary_country = meta.get(
                 destination_ids[0],
                 {},
             ).get("country")
 
         # -------------------------------------------------------------
-        # IMPORTANT:
-        # RouteGeographyEngine facts are authoritative.
-        #
-        # This function no longer queries a nonexistent
-        # drive_times_between_destinations table.
+        # ROUTE FACTS
         # -------------------------------------------------------------
 
         legs = self._build_hinges(
@@ -826,12 +811,13 @@ class ItineraryPlanningEngine:
             destination_id: meta.get(
                 destination_id,
                 {},
-            ).get(
-                "destination_type"
-            )
-            for destination_id
-            in destination_ids
+            ).get("destination_type")
+            for destination_id in destination_ids
         }
+
+        # -------------------------------------------------------------
+        # ACTIVITY POOLS
+        # -------------------------------------------------------------
 
         per_destination_pool: dict[
             str,
@@ -840,21 +826,15 @@ class ItineraryPlanningEngine:
 
         for destination_id in destination_ids:
 
-            pool = (
-                self._fetch_ranked_activity_pool(
-                    dest_id=destination_id,
-                    destination_type=(
-                        destination_types.get(
-                            destination_id
-                        )
-                    ),
-                    travel_style=travel_style,
-                    focus=focus,
-                    start_date=start_date,
-                    cabinet_id=str(
-                        cabinet.id
-                    ),
-                )
+            pool = self._fetch_ranked_activity_pool(
+                dest_id=destination_id,
+                destination_type=destination_types.get(
+                    destination_id
+                ),
+                travel_style=travel_style,
+                focus=focus,
+                start_date=start_date,
+                cabinet_id=str(cabinet.id),
             )
 
             per_destination_pool[
@@ -863,28 +843,29 @@ class ItineraryPlanningEngine:
 
             if not pool:
                 warnings.append(
-                    f"Destination {destination_id} "
-                    "has no seeded activities. "
-                    "Explicit fallback time will be used."
+                    f"Destination {destination_id} has no "
+                    "seeded activities. Explicit fallback "
+                    "time will be used."
                 )
-
             elif len(pool) < 2:
                 warnings.append(
-                    f"Destination {destination_id} "
-                    f"has only {len(pool)} seeded activity."
+                    f"Destination {destination_id} has only "
+                    f"{len(pool)} seeded activity."
                 )
 
         cursors = {
             destination_id: 0
-            for destination_id
-            in destination_ids
+            for destination_id in destination_ids
         }
 
         fallback_counters = {
             destination_id: 0
-            for destination_id
-            in destination_ids
+            for destination_id in destination_ids
         }
+
+        # -------------------------------------------------------------
+        # CALENDAR BUILD
+        # -------------------------------------------------------------
 
         day_number = 1
         current_date = start_date
@@ -893,24 +874,15 @@ class ItineraryPlanningEngine:
             destination_ids
         ):
 
-            allocated_days = (
-                day_allocation[
-                    destination_index
-                ]
+            allocated_days = normalized_allocation[
+                destination_index
+            ]
+
+            destination_type = destination_types.get(
+                destination_id
             )
 
-            if allocated_days <= 0:
-                continue
-
-            destination_type = (
-                destination_types.get(
-                    destination_id
-                )
-            )
-
-            for night_index in range(
-                allocated_days
-            ):
+            for night_index in range(allocated_days):
 
                 if day_number > days:
                     raise RuntimeError(
@@ -918,13 +890,8 @@ class ItineraryPlanningEngine:
                         "calendar days than requested."
                     )
 
-                is_first_day = (
-                    day_number == 1
-                )
-
-                is_last_day = (
-                    day_number == days
-                )
+                is_first_day = day_number == 1
+                is_last_day = day_number == days
 
                 is_arrival_day = (
                     night_index == 0
@@ -938,10 +905,17 @@ class ItineraryPlanningEngine:
                     )
                 )
 
-                archetype = (
-                    day_archetypes.get(
-                        day_number
-                    )
+                archetype = day_archetypes.get(
+                    day_number
+                )
+
+                # A final-day transition is NOT automatically a
+                # departure day. Transit classification supplied by
+                # the orchestrator wins over the generic calendar
+                # endpoint meaning.
+                effective_departure_day = (
+                    is_last_day
+                    and not is_transit_day
                 )
 
                 shelf = Shelf(
@@ -950,12 +924,12 @@ class ItineraryPlanningEngine:
                     date=current_date,
                     destination_id=destination_id,
                     theme=self._theme_for(
-                        destination_index,
-                        night_index,
-                        is_first_day,
-                        is_last_day,
-                        destination_type,
-                        is_transit_day,
+                        idx=destination_index,
+                        night_idx=night_index,
+                        is_first=is_first_day,
+                        is_last=effective_departure_day,
+                        destination_type=destination_type,
+                        is_transit_day=is_transit_day,
                         archetype=archetype,
                     ),
                     day_kind=(
@@ -967,15 +941,10 @@ class ItineraryPlanningEngine:
 
                 self.db.add(shelf)
 
-                if hasattr(
-                    shelf,
-                    "cabinet",
-                ):
+                if hasattr(shelf, "cabinet"):
                     shelf.cabinet = cabinet
                 elif shelf not in cabinet.shelves:
-                    cabinet.shelves.append(
-                        shelf
-                    )
+                    cabinet.shelves.append(shelf)
 
                 self.db.flush()
 
@@ -983,25 +952,18 @@ class ItineraryPlanningEngine:
                     destination_ids[
                         destination_index - 1
                     ]
-                    if (
-                        is_arrival_day
-                        and destination_index > 0
-                    )
+                    if is_arrival_day
                     else None
                 )
 
                 first_activity_id = (
                     self._populate_drawers(
                         shelf=shelf,
-                        pool=(
-                            per_destination_pool[
-                                destination_id
-                            ]
-                        ),
+                        pool=per_destination_pool[
+                            destination_id
+                        ],
                         cursor=cursors,
-                        fallback_counters=(
-                            fallback_counters
-                        ),
+                        fallback_counters=fallback_counters,
                         dest_id=destination_id,
                         origin_dest_id=origin_dest_id,
                         dest_type=destination_type,
@@ -1009,14 +971,12 @@ class ItineraryPlanningEngine:
                         focus=focus,
                         day_number=day_number,
                         is_first_day=is_first_day,
-                        is_last_day=is_last_day,
+                        is_last_day=effective_departure_day,
                         is_arrival_day=is_arrival_day,
                         is_transit_day=is_transit_day,
                         day_archetype=archetype,
                         legs=legs,
-                        destination_index=(
-                            destination_index
-                        ),
+                        destination_index=destination_index,
                     )
                 )
 
@@ -1025,52 +985,36 @@ class ItineraryPlanningEngine:
                     dest_id=destination_id,
                     budget_tier=budget_tier,
                     remaining_nights_here=(
-                        allocated_days
-                        - night_index
+                        allocated_days - night_index
                     ),
+                    warnings=warnings,
                 )
 
                 self._populate_armrest(
                     shelf=shelf,
                     legs=legs,
-                    destination_index=(
-                        destination_index
-                    ),
-                    is_arrival_day=(
-                        is_arrival_day
-                    ),
+                    destination_index=destination_index,
+                    is_arrival_day=is_arrival_day,
                 )
 
                 self._populate_trays(
                     shelf=shelf,
-                    is_first_day=(
-                        is_first_day
-                    ),
-                    is_last_day=(
-                        is_last_day
-                    ),
-                    is_transit_day=(
-                        is_transit_day
-                    ),
+                    is_first_day=is_first_day,
+                    is_last_day=effective_departure_day,
+                    is_transit_day=is_transit_day,
                 )
 
                 if first_activity_id:
                     self._populate_day_photo(
                         shelf=shelf,
-                        activity_id=(
-                            first_activity_id
-                        ),
-                        destination_id=(
-                            destination_id
-                        ),
+                        activity_id=first_activity_id,
+                        destination_id=destination_id,
                     )
 
                 day_number += 1
 
                 if current_date:
-                    current_date += timedelta(
-                        days=1
-                    )
+                    current_date += timedelta(days=1)
 
         if day_number != days + 1:
             raise RuntimeError(
@@ -1103,6 +1047,52 @@ class ItineraryPlanningEngine:
             ValueError,
         ):
             return default
+
+    @staticmethod
+    def _normalize_destination_ids(
+        destination_ids: list[str],
+    ) -> list[str]:
+
+        """
+        Preserve route order.
+
+        Removes:
+            - null/empty values
+            - consecutive duplicates
+
+        Does NOT remove non-consecutive repeats.
+
+        Therefore:
+
+            A -> B -> A
+
+        remains:
+
+            A -> B -> A
+        """
+
+        result: list[str] = []
+        previous: str | None = None
+
+        for raw_id in destination_ids:
+
+            if raw_id is None:
+                continue
+
+            destination_id = str(
+                raw_id
+            ).strip()
+
+            if not destination_id:
+                continue
+
+            if destination_id == previous:
+                continue
+
+            result.append(destination_id)
+            previous = destination_id
+
+        return result
 
     # -----------------------------------------------------------------
     # DESTINATION META
@@ -1154,9 +1144,10 @@ class ItineraryPlanningEngine:
                 "min_nights": 1,
             }
 
-        # Minimum-night data is useful to the orchestrator's
-        # feasibility/allocation stage. This engine only reads it.
+        # Minimum-night information belongs to feasibility/allocation.
+        # This planner only reads it.
         try:
+
             table_exists = self.db.execute(
                 text(
                     """
@@ -1215,6 +1206,7 @@ class ItineraryPlanningEngine:
                         )
 
         except Exception as exc:
+
             logger.warning(
                 "Could not read estimated_visit_durations "
                 "minimum nights: %s",
@@ -1232,6 +1224,7 @@ class ItineraryPlanningEngine:
     ) -> str | None:
 
         try:
+
             inspector = inspect(
                 self.db.bind
             )
@@ -1244,6 +1237,7 @@ class ItineraryPlanningEngine:
             }
 
         except Exception:
+
             return None
 
         candidates = (
@@ -1255,6 +1249,7 @@ class ItineraryPlanningEngine:
         )
 
         for candidate in candidates:
+
             if candidate in columns:
                 return candidate
 
@@ -1276,9 +1271,7 @@ class ItineraryPlanningEngine:
 
         ranked_categories = (
             _merged_ranked_categories(
-                destination_type=(
-                    destination_type
-                ),
+                destination_type=destination_type,
                 travel_style=travel_style,
                 focus=focus,
             )
@@ -1296,16 +1289,14 @@ class ItineraryPlanningEngine:
 
         if duration_column:
 
-            duration_expression = f"""
-                evd.{duration_column}
-            """
+            duration_expression = (
+                f"evd.{duration_column}"
+            )
 
             duration_join = """
-                LEFT JOIN
-                    estimated_visit_durations evd
-                ON evd.activity_id = a.id
-               AND evd.scope =
-                   'single_activity'
+                LEFT JOIN estimated_visit_durations evd
+                    ON evd.activity_id = a.id
+                   AND evd.scope = 'single_activity'
             """
 
         else:
@@ -1323,7 +1314,6 @@ class ItineraryPlanningEngine:
                     CAST(a.category AS text)
                         AS category,
                     a.difficulty,
-
                     a.available_months,
 
                     {duration_expression}
@@ -1346,19 +1336,14 @@ class ItineraryPlanningEngine:
                     END AS style_position,
 
                     CASE
-                        WHEN CAST(:month AS text)
-                            IS NULL
+                        WHEN CAST(:month AS text) IS NULL
                         THEN 0
 
-                        WHEN a.available_months
-                            IS NULL
+                        WHEN a.available_months IS NULL
                         THEN 0
 
-                        WHEN CAST(
-                            :month AS month_enum
-                        ) = ANY(
-                            a.available_months
-                        )
+                        WHEN CAST(:month AS month_enum)
+                            = ANY(a.available_months)
                         THEN 0
 
                         ELSE 1
@@ -1408,15 +1393,14 @@ class ItineraryPlanningEngine:
             },
         ).fetchall()
 
-        result: list[
-            dict[str, Any]
-        ] = []
+        result: list[dict[str, Any]] = []
 
         for row in rows:
 
             duration = row[5]
 
             if duration is not None:
+
                 try:
                     duration = max(
                         1,
@@ -1468,44 +1452,53 @@ class ItineraryPlanningEngine:
         origin_dest_id: str | None = None,
     ) -> str | None:
 
-        # Structural day types always win over thematic archetypes.
+        # Structural semantics take precedence.
         #
-        # 1. First day
-        # 2. Last day
-        # 3. Transit day
-        # 4. Cultural/city archetype
-        # 5. Standard destination day
+        # First day:
+        # arrival/settling semantics.
+        #
+        # Transit day:
+        # route-transition semantics.
+        #
+        # Last day:
+        # departure semantics, but only if it is not a transit day.
+        #
+        # Cultural archetype:
+        # destination-specific cultural schedule.
+        #
+        # Standard:
+        # destination-specific normal schedule.
 
         if is_first_day:
-            return self._populate_first_day_drawers(
-                shelf
-            )
 
-        if is_last_day:
-            return self._populate_last_day_drawers(
-                shelf
+            return self._populate_first_day_drawers(
+                shelf=shelf,
             )
 
         if is_transit_day:
+
             return self._populate_transit_day_drawers(
                 shelf=shelf,
                 legs=legs,
-                destination_index=(
-                    destination_index
-                ),
+                destination_index=destination_index,
                 is_arrival_day=is_arrival_day,
+            )
+
+        if is_last_day:
+
+            return self._populate_last_day_drawers(
+                shelf=shelf,
             )
 
         if _is_cultural_archetype(
             day_archetype
         ):
+
             return self._populate_cultural_day_drawers(
                 shelf=shelf,
                 pool=pool,
                 cursor=cursor,
-                fallback_counters=(
-                    fallback_counters
-                ),
+                fallback_counters=fallback_counters,
                 dest_id=dest_id,
                 dest_type=dest_type,
                 travel_style=travel_style,
@@ -1513,18 +1506,14 @@ class ItineraryPlanningEngine:
                 is_arrival_day=is_arrival_day,
                 origin_dest_id=origin_dest_id,
                 legs=legs,
-                destination_index=(
-                    destination_index
-                ),
+                destination_index=destination_index,
             )
 
         return self._populate_standard_day_drawers(
             shelf=shelf,
             pool=pool,
             cursor=cursor,
-            fallback_counters=(
-                fallback_counters
-            ),
+            fallback_counters=fallback_counters,
             dest_id=dest_id,
             dest_type=dest_type,
             travel_style=travel_style,
@@ -1532,9 +1521,7 @@ class ItineraryPlanningEngine:
             is_arrival_day=is_arrival_day,
             origin_dest_id=origin_dest_id,
             legs=legs,
-            destination_index=(
-                destination_index
-            ),
+            destination_index=destination_index,
         )
 
     # -----------------------------------------------------------------
@@ -1546,50 +1533,28 @@ class ItineraryPlanningEngine:
         shelf: Shelf,
     ) -> None:
 
+        """
+        Do not claim airport arrival or invent an airport-to-lodge
+        duration. The planner does not receive an arrival gateway fact.
+
+        The day therefore represents the beginning of the trip without
+        pretending to know how the traveler reaches the destination.
+        """
+
         order = 1
 
         self._add_drawer(
             shelf=shelf,
-            name="Airport welcome",
+            name="Arrival & settle in",
             description=(
-                "Met at the airport by your driver-guide."
+                "Arrival day. Settle into the destination and "
+                "accommodation at a comfortable pace."
             ),
             start_time=None,
-            duration_minutes=20,
+            duration_minutes=60,
             sort_order=order,
             activity_type="ARRIVAL",
-            source="hardcoded_arrival_departure",
-        )
-
-        order += 1
-
-        self._add_drawer(
-            shelf=shelf,
-            name="Transfer to lodge",
-            description=(
-                "Transfer to the lodge. No excursion is assumed "
-                "during this arrival transfer."
-            ),
-            start_time=None,
-            duration_minutes=80,
-            sort_order=order,
-            activity_type="TRANSFER",
-            source="hardcoded_arrival_departure",
-        )
-
-        order += 1
-
-        self._add_drawer(
-            shelf=shelf,
-            name="Free time at the lodge",
-            description=(
-                "Settle in and rest ahead of dinner."
-            ),
-            start_time=None,
-            duration_minutes=240,
-            sort_order=order,
-            activity_type="FREE_TIME",
-            source="hardcoded_arrival_departure",
+            source="planner_arrival_semantics",
             is_fallback=True,
         )
 
@@ -1597,7 +1562,23 @@ class ItineraryPlanningEngine:
 
         self._add_drawer(
             shelf=shelf,
-            name="Dinner at the lodge",
+            name="Free time",
+            description=(
+                "Unstructured time to rest and settle in."
+            ),
+            start_time=None,
+            duration_minutes=240,
+            sort_order=order,
+            activity_type="FREE_TIME",
+            source="planner_arrival_semantics",
+            is_fallback=True,
+        )
+
+        order += 1
+
+        self._add_drawer(
+            shelf=shelf,
+            name="Dinner",
             description=None,
             start_time=None,
             duration_minutes=90,
@@ -1614,6 +1595,13 @@ class ItineraryPlanningEngine:
         self,
         shelf: Shelf,
     ) -> None:
+
+        """
+        Departure day does not fabricate an airport transfer.
+
+        The planner has no authoritative departure gateway or
+        destination-to-airport route fact in its contract.
+        """
 
         order = 1
 
@@ -1632,26 +1620,17 @@ class ItineraryPlanningEngine:
 
         self._add_drawer(
             shelf=shelf,
-            name="Transfer to airport",
-            description=None,
-            start_time=None,
-            duration_minutes=120,
-            sort_order=order,
-            activity_type="TRANSFER",
-            source="hardcoded_arrival_departure",
-        )
-
-        order += 1
-
-        self._add_drawer(
-            shelf=shelf,
             name="Departure",
-            description=None,
+            description=(
+                "Trip departure. Final transfer and departure "
+                "timing should be confirmed with the operator."
+            ),
             start_time=None,
             duration_minutes=30,
             sort_order=order,
             activity_type="DEPARTURE",
-            source="hardcoded_arrival_departure",
+            source="planner_departure_semantics",
+            is_fallback=True,
         )
 
     # -----------------------------------------------------------------
@@ -1667,89 +1646,117 @@ class ItineraryPlanningEngine:
     ) -> None:
 
         order = 1
+
         leg: dict[str, Any] | None = None
 
         if (
             is_arrival_day
             and destination_index > 0
-            and destination_index - 1 < len(legs)
         ):
-            leg = legs[
-                destination_index - 1
-            ]
-
-        mode = (
-            leg.get("mode")
-            if leg
-            else None
-        ) or "charter_flight"
-
-        duration_minutes = (
-            leg.get("duration_minutes")
-            if leg
-            else None
-        )
-
-        transfer_description = (
-            _format_transfer_description(
-                mode,
-                duration_minutes,
+            leg = self._get_arrival_leg(
+                legs=legs,
+                destination_index=destination_index,
             )
-        )
 
-        effective_duration = (
-            duration_minutes
-            if duration_minutes is not None
-            else FALLBACK_TRANSIT_LEG_MINUTES
-        )
+        if leg is None:
 
-        self._add_drawer(
-            shelf=shelf,
-            name="Long-distance transfer",
-            description=transfer_description,
-            start_time=None,
-            duration_minutes=effective_duration,
-            sort_order=order,
-            activity_type="TRANSFER",
-            source=(
-                leg.get("source")
-                if leg
+            logger.warning(
+                "Transit day %s has no matching incoming "
+                "RouteGeography leg.",
+                shelf.day_number,
+            )
+
+            self._add_drawer(
+                shelf=shelf,
+                name="Destination transfer",
+                description=(
+                    "This day is classified as a transit day, "
+                    "but no matching route leg was supplied. "
+                    "Transport details remain unavailable."
+                ),
+                start_time=None,
+                duration_minutes=(
+                    FALLBACK_TRANSIT_LEG_MINUTES
+                ),
+                sort_order=order,
+                activity_type="TRANSFER",
+                source="unavailable",
+                is_fallback=True,
+                destination_id=shelf.destination_id,
+            )
+
+        else:
+
+            duration = self._coerce_optional_int(
+                leg.get("duration_minutes")
+            )
+
+            mode = (
+                str(leg.get("mode")).strip()
+                if leg.get("mode")
+                else None
+            )
+
+            source = (
+                str(leg.get("source")).strip()
+                if leg.get("source")
                 else "unavailable"
-            ) or "unavailable",
-            is_fallback=(
-                duration_minutes is None
-            ),
-        )
+            )
+
+            description = _format_transfer_description(
+                mode=mode,
+                minutes=duration,
+            )
+
+            effective_duration = (
+                duration
+                if duration is not None
+                else FALLBACK_TRANSIT_LEG_MINUTES
+            )
+
+            self._add_drawer(
+                shelf=shelf,
+                name="Long-distance transfer",
+                description=description,
+                start_time=None,
+                duration_minutes=effective_duration,
+                sort_order=order,
+                activity_type="TRANSFER",
+                source=source,
+                is_fallback=duration is None,
+                destination_id=shelf.destination_id,
+            )
 
         order += 1
 
         self._add_drawer(
             shelf=shelf,
-            name="Free time at the lodge",
+            name="Settle in",
             description=(
-                "Most of this day is spent travelling between "
-                "destinations. No activity is scheduled so there "
-                "is time to rest and settle in on arrival."
+                "Time to rest and settle into the destination "
+                "after the journey."
             ),
             start_time=None,
             duration_minutes=180,
             sort_order=order,
             activity_type="FREE_TIME",
-            source="hardcoded_transit_day",
+            source="planner_transit_semantics",
             is_fallback=True,
+            destination_id=shelf.destination_id,
         )
 
         order += 1
 
         self._add_drawer(
             shelf=shelf,
-            name="Dinner at the lodge",
+            name="Dinner",
             description=None,
             start_time=None,
             duration_minutes=90,
             sort_order=order,
             activity_type="MEAL",
             source="hardcoded_meal",
+            destination_id=shelf.destination_id,
         )
 
     # -----------------------------------------------------------------
@@ -1777,17 +1784,13 @@ class ItineraryPlanningEngine:
 
         if is_arrival_day:
 
-            order, _ = (
-                self._destination_arrival_transfer(
-                    shelf=shelf,
-                    order=order,
-                    leg=self._get_arrival_leg(
-                        legs=legs,
-                        destination_index=(
-                            destination_index
-                        ),
-                    ),
-                )
+            order, _ = self._destination_arrival_transfer(
+                shelf=shelf,
+                order=order,
+                leg=self._get_arrival_leg(
+                    legs=legs,
+                    destination_index=destination_index,
+                ),
             )
 
             order += 1
@@ -1795,34 +1798,30 @@ class ItineraryPlanningEngine:
         max_activity_minutes = max(
             60,
             int(
-                MAX_NORMAL_ACTIVITY_HOURS_PER_DAY
-                * 60
+                MAX_NORMAL_ACTIVITY_HOURS_PER_DAY * 60
             ),
         )
 
         packed_minutes = 0
         activities_added = 0
 
-        while (
-            cursor.get(dest_id, 0)
-            < len(pool)
-        ):
+        while cursor.get(dest_id, 0) < len(pool):
 
             position = cursor.get(
                 dest_id,
                 0,
             )
 
-            activity = pool[
-                position
-            ]
+            activity = pool[position]
 
             duration = activity.get(
                 "estimated_visit_duration_minutes"
             )
 
             if duration is None:
-                planning_duration = 120
+                planning_duration = (
+                    FALLBACK_ACTIVITY_DURATION_MINUTES
+                )
                 duration_is_estimated = True
             else:
                 planning_duration = max(
@@ -1842,14 +1841,12 @@ class ItineraryPlanningEngine:
             ):
                 break
 
-            cursor[
-                dest_id
-            ] = position + 1
+            cursor[dest_id] = position + 1
 
             source = (
                 "estimated_visit_durations"
                 if not duration_is_estimated
-                else "activities_table_duration_estimate"
+                else "planning_fallback_duration"
             )
 
             self._add_drawer(
@@ -1859,50 +1856,35 @@ class ItineraryPlanningEngine:
                     "description"
                 ),
                 start_time=None,
-                duration_minutes=(
-                    planning_duration
-                ),
+                duration_minutes=planning_duration,
                 sort_order=order,
                 activity_type="EXPERIENCE",
                 activity_id=activity["id"],
                 source=source,
-                is_fallback=(
-                    duration_is_estimated
-                ),
+                is_fallback=duration_is_estimated,
+                destination_id=dest_id,
             )
 
             if first_activity_id is None:
-                first_activity_id = (
+                first_activity_id = str(
                     activity["id"]
                 )
 
-            packed_minutes += (
-                planning_duration
-            )
-
+            packed_minutes += planning_duration
             activities_added += 1
             order += 1
 
-            if (
-                packed_minutes
-                >= max_activity_minutes
-            ):
+            if packed_minutes >= max_activity_minutes:
                 break
 
         if activities_added == 0:
 
-            title, description = (
-                _fallback_drawer_text(
-                    dest_type,
-                    fallback_counters[
-                        dest_id
-                    ],
-                )
+            title, description = _fallback_drawer_text(
+                dest_type,
+                fallback_counters[dest_id],
             )
 
-            fallback_counters[
-                dest_id
-            ] += 1
+            fallback_counters[dest_id] += 1
 
             self._add_drawer(
                 shelf=shelf,
@@ -1912,8 +1894,9 @@ class ItineraryPlanningEngine:
                 duration_minutes=120,
                 sort_order=order,
                 activity_type="FREE_TIME",
-                source="fallback_estimate",
+                source="fallback_activity",
                 is_fallback=True,
+                destination_id=dest_id,
             )
 
             logger.warning(
@@ -1934,6 +1917,7 @@ class ItineraryPlanningEngine:
             sort_order=order,
             activity_type="MEAL",
             source="hardcoded_meal",
+            destination_id=dest_id,
         )
 
         order += 1
@@ -1946,8 +1930,7 @@ class ItineraryPlanningEngine:
 
         if (
             remaining_after_lunch >= 60
-            and cursor.get(dest_id, 0)
-            < len(pool)
+            and cursor.get(dest_id, 0) < len(pool)
         ):
 
             position = cursor.get(
@@ -1955,16 +1938,16 @@ class ItineraryPlanningEngine:
                 0,
             )
 
-            activity = pool[
-                position
-            ]
+            activity = pool[position]
 
             duration = activity.get(
                 "estimated_visit_duration_minutes"
             )
 
             if duration is None:
-                planning_duration = 120
+                planning_duration = (
+                    FALLBACK_ACTIVITY_DURATION_MINUTES
+                )
                 duration_is_estimated = True
             else:
                 planning_duration = max(
@@ -1973,14 +1956,9 @@ class ItineraryPlanningEngine:
                 )
                 duration_is_estimated = False
 
-            if (
-                planning_duration
-                <= remaining_after_lunch
-            ):
+            if planning_duration <= remaining_after_lunch:
 
-                cursor[
-                    dest_id
-                ] = position + 1
+                cursor[dest_id] = position + 1
 
                 self._add_drawer(
                     shelf=shelf,
@@ -1989,24 +1967,21 @@ class ItineraryPlanningEngine:
                         "description"
                     ),
                     start_time=None,
-                    duration_minutes=(
-                        planning_duration
-                    ),
+                    duration_minutes=planning_duration,
                     sort_order=order,
                     activity_type="EXPERIENCE",
                     activity_id=activity["id"],
                     source=(
                         "estimated_visit_durations"
                         if not duration_is_estimated
-                        else "activities_table_duration_estimate"
+                        else "planning_fallback_duration"
                     ),
-                    is_fallback=(
-                        duration_is_estimated
-                    ),
+                    is_fallback=duration_is_estimated,
+                    destination_id=dest_id,
                 )
 
                 if first_activity_id is None:
-                    first_activity_id = (
+                    first_activity_id = str(
                         activity["id"]
                     )
 
@@ -2018,8 +1993,8 @@ class ItineraryPlanningEngine:
                 shelf=shelf,
                 name="Free evening",
                 description=(
-                    "Unstructured evening time after the "
-                    "day's exploration."
+                    "Unstructured evening time after "
+                    "the day's exploration."
                 ),
                 start_time=None,
                 duration_minutes=90,
@@ -2027,6 +2002,7 @@ class ItineraryPlanningEngine:
                 activity_type="FREE_TIME",
                 source="hardcoded_relaxed_pace",
                 is_fallback=True,
+                destination_id=dest_id,
             )
 
         return first_activity_id
@@ -2056,53 +2032,48 @@ class ItineraryPlanningEngine:
 
         if is_arrival_day:
 
-            order, _ = (
-                self._destination_arrival_transfer(
-                    shelf=shelf,
-                    order=order,
-                    leg=self._get_arrival_leg(
-                        legs=legs,
-                        destination_index=(
-                            destination_index
-                        ),
-                    ),
-                )
+            order, _ = self._destination_arrival_transfer(
+                shelf=shelf,
+                order=order,
+                leg=self._get_arrival_leg(
+                    legs=legs,
+                    destination_index=destination_index,
+                ),
             )
 
             order += 1
 
         if is_arrival_day:
-
             morning = None
-
         else:
-
-            morning = (
-                self._consume_next_activity(
-                    pool=pool,
-                    cursor=cursor,
-                    dest_id=dest_id,
-                )
+            morning = self._consume_next_activity(
+                pool=pool,
+                cursor=cursor,
+                dest_id=dest_id,
             )
 
         if morning:
 
-            first_activity_id = (
+            first_activity_id = str(
                 morning["id"]
             )
 
             morning_is_game_drive = (
                 _is_game_drive_category(
-                    morning["category"]
+                    morning.get("category")
                 )
             )
 
-            duration = (
-                morning.get(
-                    "estimated_visit_duration_minutes"
-                )
-                or 240
+            duration = morning.get(
+                "estimated_visit_duration_minutes"
             )
+
+            duration_is_fallback = duration is None
+
+            if duration is None:
+                duration = (
+                    FALLBACK_MORNING_ACTIVITY_MINUTES
+                )
 
             self._add_drawer(
                 shelf=shelf,
@@ -2115,42 +2086,29 @@ class ItineraryPlanningEngine:
                     if morning_is_game_drive
                     else None
                 ),
-                duration_minutes=int(
-                    duration
-                ),
+                duration_minutes=int(duration),
                 sort_order=order,
                 activity_type="EXPERIENCE",
                 activity_id=morning["id"],
                 source=(
                     "estimated_visit_durations"
-                    if morning.get(
-                        "estimated_visit_duration_minutes"
-                    )
-                    else "activities_table"
+                    if not duration_is_fallback
+                    else "planning_fallback_duration"
                 ),
-                is_fallback=not bool(
-                    morning.get(
-                        "estimated_visit_duration_minutes"
-                    )
-                ),
+                is_fallback=duration_is_fallback,
+                destination_id=dest_id,
             )
 
             order += 1
 
         elif not is_arrival_day:
 
-            title, description = (
-                _fallback_drawer_text(
-                    dest_type,
-                    fallback_counters[
-                        dest_id
-                    ],
-                )
+            title, description = _fallback_drawer_text(
+                dest_type,
+                fallback_counters[dest_id],
             )
 
-            fallback_counters[
-                dest_id
-            ] += 1
+            fallback_counters[dest_id] += 1
 
             self._add_drawer(
                 shelf=shelf,
@@ -2160,8 +2118,9 @@ class ItineraryPlanningEngine:
                 duration_minutes=180,
                 sort_order=order,
                 activity_type="EXPERIENCE",
-                source="fallback_estimate",
+                source="fallback_activity",
                 is_fallback=True,
+                destination_id=dest_id,
             )
 
             logger.warning(
@@ -2182,37 +2141,40 @@ class ItineraryPlanningEngine:
             sort_order=order,
             activity_type="MEAL",
             source="hardcoded_meal",
+            destination_id=dest_id,
         )
 
         order += 1
 
-        afternoon = (
-            self._consume_next_activity(
-                pool=pool,
-                cursor=cursor,
-                dest_id=dest_id,
-            )
+        afternoon = self._consume_next_activity(
+            pool=pool,
+            cursor=cursor,
+            dest_id=dest_id,
         )
 
         if afternoon:
 
             if first_activity_id is None:
-                first_activity_id = (
+                first_activity_id = str(
                     afternoon["id"]
                 )
 
             afternoon_is_game_drive = (
                 _is_game_drive_category(
-                    afternoon["category"]
+                    afternoon.get("category")
                 )
             )
 
-            duration = (
-                afternoon.get(
-                    "estimated_visit_duration_minutes"
-                )
-                or 150
+            duration = afternoon.get(
+                "estimated_visit_duration_minutes"
             )
+
+            duration_is_fallback = duration is None
+
+            if duration is None:
+                duration = (
+                    FALLBACK_AFTERNOON_ACTIVITY_MINUTES
+                )
 
             self._add_drawer(
                 shelf=shelf,
@@ -2225,40 +2187,27 @@ class ItineraryPlanningEngine:
                     if afternoon_is_game_drive
                     else None
                 ),
-                duration_minutes=int(
-                    duration
-                ),
+                duration_minutes=int(duration),
                 sort_order=order,
                 activity_type="EXPERIENCE",
                 activity_id=afternoon["id"],
                 source=(
                     "estimated_visit_durations"
-                    if afternoon.get(
-                        "estimated_visit_duration_minutes"
-                    )
-                    else "activities_table"
+                    if not duration_is_fallback
+                    else "planning_fallback_duration"
                 ),
-                is_fallback=not bool(
-                    afternoon.get(
-                        "estimated_visit_duration_minutes"
-                    )
-                ),
+                is_fallback=duration_is_fallback,
+                destination_id=dest_id,
             )
 
         else:
 
-            title, description = (
-                _fallback_drawer_text(
-                    dest_type,
-                    fallback_counters[
-                        dest_id
-                    ],
-                )
+            title, description = _fallback_drawer_text(
+                dest_type,
+                fallback_counters[dest_id],
             )
 
-            fallback_counters[
-                dest_id
-            ] += 1
+            fallback_counters[dest_id] += 1
 
             self._add_drawer(
                 shelf=shelf,
@@ -2268,8 +2217,9 @@ class ItineraryPlanningEngine:
                 duration_minutes=150,
                 sort_order=order,
                 activity_type="EXPERIENCE",
-                source="fallback_estimate",
+                source="fallback_activity",
                 is_fallback=True,
+                destination_id=dest_id,
             )
 
             logger.warning(
@@ -2295,6 +2245,7 @@ class ItineraryPlanningEngine:
                 activity_type="EXPERIENCE",
                 source="hardcoded_relaxed_pace",
                 is_fallback=True,
+                destination_id=dest_id,
             )
 
         return first_activity_id
@@ -2312,16 +2263,17 @@ class ItineraryPlanningEngine:
         if destination_index <= 0:
             return None
 
-        leg_index = (
-            destination_index - 1
-        )
+        expected_from_index = destination_index - 1
 
-        if leg_index >= len(legs):
+        if expected_from_index >= len(legs):
             return None
 
-        return legs[
-            leg_index
-        ]
+        leg = legs[expected_from_index]
+
+        if not isinstance(leg, Mapping):
+            return None
+
+        return dict(leg)
 
     def _destination_arrival_transfer(
         self,
@@ -2333,17 +2285,19 @@ class ItineraryPlanningEngine:
         if leg is None:
 
             logger.warning(
-                "Arrival transfer has no RouteGeography "
-                "fact. Duration remains unavailable."
+                "Arrival day %s has no RouteGeography "
+                "transition fact. Transfer duration remains "
+                "unavailable.",
+                shelf.day_number,
             )
 
             self._add_drawer(
                 shelf=shelf,
                 name="Arrival transfer",
                 description=(
-                    "Transfer into the destination. Duration "
-                    "is unavailable from the current route data; "
-                    "a scheduling fallback is used internally."
+                    "Transfer into the destination. Transport "
+                    "mode and duration are unavailable from "
+                    "the current route data; confirm before booking."
                 ),
                 start_time=None,
                 duration_minutes=(
@@ -2353,6 +2307,7 @@ class ItineraryPlanningEngine:
                 activity_type="TRANSFER",
                 source="unavailable",
                 is_fallback=True,
+                destination_id=shelf.destination_id,
             )
 
             return (
@@ -2360,40 +2315,29 @@ class ItineraryPlanningEngine:
                 False,
             )
 
-        duration = leg.get(
-            "duration_minutes"
+        duration = self._coerce_optional_int(
+            leg.get("duration_minutes")
         )
-
-        if duration is not None:
-            try:
-                duration = max(
-                    1,
-                    int(duration),
-                )
-            except (
-                TypeError,
-                ValueError,
-            ):
-                duration = None
 
         mode = (
-            leg.get("mode")
-            or "private_4x4"
+            str(leg.get("mode")).strip()
+            if leg.get("mode")
+            else None
         )
 
-        if duration is not None:
+        source = (
+            str(leg.get("source")).strip()
+            if leg.get("source")
+            else "unavailable"
+        )
 
-            description = (
-                "Transfer into the destination. "
-                f"{_format_transfer_description(mode, duration)}."
+        description = (
+            "Transfer into the destination. "
+            + _format_transfer_description(
+                mode=mode,
+                minutes=duration,
             )
-
-        else:
-
-            description = (
-                "Transfer into the destination. "
-                f"{_format_transfer_description(mode, None)}."
-            )
+        )
 
         effective_duration = (
             duration
@@ -2409,13 +2353,9 @@ class ItineraryPlanningEngine:
             duration_minutes=effective_duration,
             sort_order=order,
             activity_type="TRANSFER",
-            source=(
-                leg.get("source")
-                or "unavailable"
-            ),
-            is_fallback=(
-                duration is None
-            ),
+            source=source,
+            is_fallback=duration is None,
+            destination_id=shelf.destination_id,
         )
 
         return (
@@ -2442,13 +2382,9 @@ class ItineraryPlanningEngine:
         if position >= len(pool):
             return None
 
-        activity = pool[
-            position
-        ]
+        activity = pool[position]
 
-        cursor[
-            dest_id
-        ] = position + 1
+        cursor[dest_id] = position + 1
 
         return activity
 
@@ -2468,6 +2404,7 @@ class ItineraryPlanningEngine:
         activity_id: Any = None,
         source: str = "activities_table",
         is_fallback: bool = False,
+        destination_id: str | None = None,
     ) -> Drawer:
 
         drawer = Drawer(
@@ -2484,11 +2421,18 @@ class ItineraryPlanningEngine:
             activity_type=activity_type,
             source=source,
             is_fallback=is_fallback,
+            destination_id=(
+                destination_id
+                if destination_id is not None
+                else getattr(
+                    shelf,
+                    "destination_id",
+                    None,
+                )
+            ),
         )
 
-        shelf.drawers.append(
-            drawer
-        )
+        shelf.drawers.append(drawer)
 
         return drawer
 
@@ -2506,52 +2450,35 @@ class ItineraryPlanningEngine:
 
         cabinet_id = cabinet.id
 
-        legs: list[
-            dict[str, Any]
-        ] = []
-
+        legs: list[dict[str, Any]] = []
         sequence = 0
 
         for index in range(
             len(destination_ids) - 1
         ):
 
-            frm = destination_ids[
-                index
-            ]
-
-            to = destination_ids[
-                index + 1
-            ]
+            frm = destination_ids[index]
+            to = destination_ids[index + 1]
 
             if frm == to:
                 continue
 
-            route_fact = (
-                self._find_route_fact(
-                    route_facts=route_facts,
-                    from_destination=frm,
-                    to_destination=to,
-                )
+            route_fact = self._find_route_fact(
+                route_facts=route_facts,
+                from_destination=frm,
+                to_destination=to,
             )
 
-            from_country = (
-                meta.get(
-                    frm,
-                    {},
-                ).get("country")
-            )
+            from_country = meta.get(
+                frm,
+                {},
+            ).get("country")
 
-            to_country = (
-                meta.get(
-                    to,
-                    {},
-                ).get("country")
-            )
+            to_country = meta.get(
+                to,
+                {},
+            ).get("country")
 
-            # RouteGeographyEngine is authoritative. Country metadata
-            # is only a safe fallback when the route fact does not carry
-            # the inter-country flag.
             if route_fact is not None:
 
                 is_inter_country = bool(
@@ -2569,15 +2496,12 @@ class ItineraryPlanningEngine:
                     and from_country != to_country
                 )
 
-            duration_minutes = None
-            distance_km = None
+            duration_minutes: int | None = None
+            distance_km: float | None = None
             source = "unavailable"
-            mode = (
-                "charter_flight"
-                if is_inter_country
-                else "private_4x4"
-            )
+            mode: str | None = None
             border_crossing_id = None
+            requires_border_crossing = False
 
             if route_fact:
 
@@ -2598,22 +2522,33 @@ class ItineraryPlanningEngine:
                 )
 
                 source = (
-                    route_fact.get(
-                        "source"
-                    )
-                    or "unavailable"
+                    str(
+                        route_fact.get("source")
+                    ).strip()
+                    if route_fact.get("source")
+                    else "unavailable"
                 )
 
                 mode = (
-                    route_fact.get(
-                        "mode"
-                    )
-                    or mode
+                    str(
+                        route_fact.get("mode")
+                    ).strip()
+                    if route_fact.get("mode")
+                    else None
                 )
 
                 border_crossing_id = (
                     route_fact.get(
                         "border_crossing_id"
+                    )
+                )
+
+                # Only claim a land-border fact when the authoritative
+                # route fact actually says that one is required.
+                requires_border_crossing = bool(
+                    route_fact.get(
+                        "requires_border_crossing",
+                        False,
                     )
                 )
 
@@ -2626,9 +2561,19 @@ class ItineraryPlanningEngine:
                 )
 
             if duration_minutes is None:
+
                 logger.warning(
                     "Route duration unavailable for "
                     "%s -> %s. No duration is invented.",
+                    frm,
+                    to,
+                )
+
+            if mode is None:
+
+                logger.warning(
+                    "Route transport mode unavailable for "
+                    "%s -> %s. No transport mode is invented.",
                     frm,
                     to,
                 )
@@ -2646,23 +2591,12 @@ class ItineraryPlanningEngine:
                 source=source,
                 is_inter_country=is_inter_country,
                 requires_border_crossing=(
-                    bool(
-                        route_fact.get(
-                            "requires_border_crossing",
-                            is_inter_country,
-                        )
-                    )
-                    if route_fact
-                    else is_inter_country
+                    requires_border_crossing
                 ),
-                border_crossing_id=(
-                    border_crossing_id
-                ),
+                border_crossing_id=border_crossing_id,
             )
 
-            self.db.add(
-                hinge
-            )
+            self.db.add(hinge)
 
             if hasattr(
                 hinge,
@@ -2670,32 +2604,19 @@ class ItineraryPlanningEngine:
             ):
                 hinge.cabinet = cabinet
             elif hinge not in cabinet.hinges:
-                cabinet.hinges.append(
-                    hinge
-                )
+                cabinet.hinges.append(hinge)
 
             legs.append(
                 {
                     "from": frm,
                     "to": to,
-                    "duration_minutes": (
-                        duration_minutes
-                    ),
+                    "duration_minutes": duration_minutes,
                     "distance_km": distance_km,
                     "source": source,
                     "mode": mode,
-                    "is_inter_country": (
-                        is_inter_country
-                    ),
+                    "is_inter_country": is_inter_country,
                     "requires_border_crossing": (
-                        bool(
-                            route_fact.get(
-                                "requires_border_crossing",
-                                is_inter_country,
-                            )
-                        )
-                        if route_fact
-                        else is_inter_country
+                        requires_border_crossing
                     ),
                     "border_crossing_id": (
                         border_crossing_id
@@ -2711,6 +2632,14 @@ class ItineraryPlanningEngine:
         from_destination: str,
         to_destination: str,
     ) -> dict[str, Any] | None:
+
+        """
+        Exact transition matching.
+
+        This deliberately does not rely on a dictionary keyed only by
+        destination ID because routes such as A -> B -> A contain
+        multiple occurrences of the same destination.
+        """
 
         for fact in route_facts:
 
@@ -2749,11 +2678,9 @@ class ItineraryPlanningEngine:
             ):
                 return dict(fact)
 
-            # Some route engines wrap the actual leg.
-            nested = fact.get(
-                "route"
-            ) or fact.get(
-                "leg"
+            nested = (
+                fact.get("route")
+                or fact.get("leg")
             )
 
             if isinstance(
@@ -2766,12 +2693,18 @@ class ItineraryPlanningEngine:
                     or nested.get(
                         "from_destination_id"
                     )
+                    or nested.get(
+                        "origin_destination_id"
+                    )
                 )
 
                 nested_to = (
                     nested.get("to")
                     or nested.get(
                         "to_destination_id"
+                    )
+                    or nested.get(
+                        "destination_id"
                     )
                 )
 
@@ -2831,7 +2764,17 @@ class ItineraryPlanningEngine:
         dest_id: str,
         budget_tier: str,
         remaining_nights_here: int,
+        warnings: list[str],
     ) -> None:
+
+        """
+        Accommodation is only persisted when a real lodge record
+        exists.
+
+        A fabricated "Luxury lodge" / "Mid lodge" label is deliberately
+        not created because that would present an invented property
+        as factual accommodation.
+        """
 
         tier_map = {
             "budget": (
@@ -2877,6 +2820,24 @@ class ItineraryPlanningEngine:
             },
         ).fetchone()
 
+        if not row:
+
+            warnings.append(
+                f"No seeded lodge matched destination "
+                f"{dest_id} for budget tier "
+                f"'{budget_tier}'. Accommodation was "
+                "left unassigned rather than fabricated."
+            )
+
+            logger.warning(
+                "No lodge found for destination %s and tier %s. "
+                "No generic accommodation name will be created.",
+                dest_id,
+                budget_tier,
+            )
+
+            return
+
         check_out = None
 
         if (
@@ -2890,37 +2851,20 @@ class ItineraryPlanningEngine:
                 )
             )
 
-        if row:
-
-            headboard = Headboard(
-                shelf_id=shelf.id,
-                lodge_id=row[0],
-                name=row[1],
-                tier=row[2],
-                check_in=shelf.date,
-                check_out=check_out,
-                nights=remaining_nights_here,
-            )
-
-        else:
-
-            headboard = Headboard(
-                shelf_id=shelf.id,
-                name=(
-                    f"{budget_tier.title()} lodge"
-                ),
-                tier=budget_tier,
-                check_in=shelf.date,
-                check_out=check_out,
-                nights=remaining_nights_here,
-            )
-
-        self.db.add(
-            headboard
+        headboard = Headboard(
+            shelf_id=shelf.id,
+            lodge_id=row[0],
+            name=row[1],
+            tier=row[2],
+            check_in=shelf.date,
+            check_out=check_out,
+            nights=remaining_nights_here,
         )
 
+        self.db.add(headboard)
+
     # -----------------------------------------------------------------
-    # ARMREST
+    # ARMREST / TRANSPORT
     # -----------------------------------------------------------------
 
     def _populate_armrest(
@@ -2931,60 +2875,65 @@ class ItineraryPlanningEngine:
         is_arrival_day: bool,
     ) -> None:
 
-        if (
-            is_arrival_day
-            and destination_index > 0
-            and destination_index - 1
-            < len(legs)
-        ):
+        """
+        Armrest represents inter-destination transport only when the
+        current day actually corresponds to a route transition.
 
-            leg = legs[
-                destination_index - 1
-            ]
+        It must not display "Private 4x4" on every normal safari day.
+        """
 
-            minutes = (
-                leg.get(
-                    "duration_minutes"
-                )
-            )
+        if not is_arrival_day:
+            return
 
-            mode = (
-                leg.get("mode")
-                or "private_4x4"
-            )
-
-            description = (
-                _format_transfer_description(
-                    mode,
-                    minutes,
-                )
-            )
-
-            armrest = Armrest(
-                shelf_id=shelf.id,
-                mode=mode,
-                description=description,
-                duration_minutes=minutes,
-                is_private=(
-                    mode == "private_4x4"
-                ),
-            )
-
-        else:
-
-            armrest = Armrest(
-                shelf_id=shelf.id,
-                mode="private_4x4",
-                description=(
-                    "Private 4x4 · local destination transport"
-                ),
-                duration_minutes=0,
-                is_private=True,
-            )
-
-        self.db.add(
-            armrest
+        leg = self._get_arrival_leg(
+            legs=legs,
+            destination_index=destination_index,
         )
+
+        if leg is None:
+
+            armrest = Armrest(
+                shelf_id=shelf.id,
+                mode=None,
+                description=(
+                    "Arrival transport details unavailable "
+                    "from the current route data."
+                ),
+                duration_minutes=None,
+                is_private=False,
+            )
+
+            self.db.add(armrest)
+            return
+
+        minutes = self._coerce_optional_int(
+            leg.get("duration_minutes")
+        )
+
+        mode = (
+            str(leg.get("mode")).strip()
+            if leg.get("mode")
+            else None
+        )
+
+        description = _format_transfer_description(
+            mode=mode,
+            minutes=minutes,
+        )
+
+        is_private = (
+            mode == "private_4x4"
+        )
+
+        armrest = Armrest(
+            shelf_id=shelf.id,
+            mode=mode,
+            description=description,
+            duration_minutes=minutes,
+            is_private=is_private,
+        )
+
+        self.db.add(armrest)
 
     # -----------------------------------------------------------------
     # MEALS
@@ -3001,11 +2950,11 @@ class ItineraryPlanningEngine:
         if is_first_day:
             meals = ["dinner"]
 
-        elif is_last_day:
-            meals = ["breakfast"]
-
         elif is_transit_day:
             meals = ["dinner"]
+
+        elif is_last_day:
+            meals = ["breakfast"]
 
         else:
             meals = [
@@ -3115,10 +3064,7 @@ class ItineraryPlanningEngine:
                     exc,
                 )
 
-        if (
-            not row
-            or not row[0]
-        ):
+        if not row or not row[0]:
             return
 
         image_url = row[0]
@@ -3168,9 +3114,7 @@ class ItineraryPlanningEngine:
             return "Departure"
 
         archetype_normalized = (
-            _normalise_archetype(
-                archetype
-            )
+            _normalise_archetype(archetype)
         )
 
         if archetype_normalized in {
@@ -3183,7 +3127,13 @@ class ItineraryPlanningEngine:
         }:
             return "Culture & discovery"
 
-        if destination_type in {
+        normalized_type = (
+            str(destination_type).strip().lower()
+            if destination_type
+            else None
+        )
+
+        if normalized_type in {
             "national_park",
             "game_reserve",
         }:
@@ -3194,23 +3144,21 @@ class ItineraryPlanningEngine:
                 else "Deeper into the park"
             )
 
-        if destination_type in {
+        if normalized_type in {
             "island",
             "beach",
             "marine_park",
         }:
-            return (
-                "Coast, water & open horizons"
-            )
+            return "Coast, water & open horizons"
 
-        if destination_type in {
+        if normalized_type in {
             "mountain",
             "waterfall",
             "forest_reserve",
         }:
             return "Nature & exploration"
 
-        if destination_type in {
+        if normalized_type in {
             "city",
             "cultural_site",
             "unesco_site",
@@ -3230,59 +3178,54 @@ class ItineraryPlanningEngine:
 
         styles: list[str] = []
 
-        focus = request.get(
-            "focus"
-        )
+        focus = request.get("focus")
 
-        if focus == "wildlife":
-            styles.append(
-                "wildlife"
+        if focus:
+            normalized_focus = (
+                str(focus).strip().lower()
             )
 
-        elif focus in {
-            "beach",
-            "adventure",
-            "culture",
-            "cultural",
-            "photography",
-            "birding",
-            "walking",
-        }:
-            styles.append(
-                str(focus)
-            )
+            if normalized_focus in {
+                "wildlife",
+                "beach",
+                "adventure",
+                "culture",
+                "cultural",
+                "photography",
+                "birding",
+                "walking",
+            }:
+                styles.append(
+                    normalized_focus
+                )
 
         if (
-            request.get(
-                "budget_tier"
-            )
+            str(
+                request.get(
+                    "budget_tier",
+                    "",
+                )
+            ).strip().lower()
             == "luxury"
         ):
-            styles.append(
-                "luxury"
-            )
+            styles.append("luxury")
 
         if (
             ItineraryPlanningEngine._safe_int(
-                request.get(
-                    "travelers"
-                ),
+                request.get("travelers"),
                 2,
             )
             <= 2
         ):
-            styles.append(
-                "private"
-            )
+            styles.append("private")
 
-        styles.append(
-            "relaxed_pace"
-        )
+        # Relaxed pace remains an inferred product style. It does not
+        # override explicit focus and does not create factual transport
+        # or attraction data.
+        styles.append("relaxed_pace")
 
         return list(
-            dict.fromkeys(
-                styles
-            )
+            dict.fromkeys(styles)
         )
 
     @staticmethod
