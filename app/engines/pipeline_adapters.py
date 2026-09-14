@@ -63,8 +63,6 @@ This module does NOT:
 - treat country changes as an excuse to fabricate travel times;
 - decide which activities belong to a destination;
 - repair schedules.
-
-Those responsibilities belong to the appropriate engines.
 """
 
 from __future__ import annotations
@@ -521,6 +519,8 @@ def minimum_days_required_for_route(
     Geographic feasibility remains a separate responsibility.
     """
 
+    del route_analysis
+
     if not destination_order:
         return 0
 
@@ -539,8 +539,8 @@ def _route_has_known_hard_problem(
     destination_order: Sequence[str],
 ) -> bool:
     """
-    Detect only hard route-analysis failures that are explicitly
-    represented by the geography layer.
+    Detect only hard route-analysis failures explicitly represented by
+    the geography layer.
 
     Unknown transport duration is NOT a hard failure.
 
@@ -573,8 +573,6 @@ def _route_has_known_hard_problem(
         if leg is None:
             continue
 
-        # Explicitly closed/restricted border routes are hard geographic
-        # problems when the geography engine marks the leg accordingly.
         if bool(
             getattr(
                 leg,
@@ -614,17 +612,14 @@ def find_feasible_destination_order(
 
     because that changes the user's route.
 
-    IMPORTANT:
-
-    This function does not pretend to solve route optimization.
+    This function does not solve route optimization.
 
     It evaluates:
         1. destination stay requirements;
-        2. explicit route-analysis integrity;
-        3. explicit hard route failures, when available.
+        2. destination order;
+        3. explicit route-analysis hard failures.
 
-    Unknown transport duration remains unknown and therefore does not
-    cause an arbitrary destination to be removed.
+    Unknown transport duration remains unknown.
     """
 
     cleaned = normalize_destination_order(
@@ -640,10 +635,14 @@ def find_feasible_destination_order(
             "cannot be evaluated."
         ]
 
-    warnings = validate_route_analysis_order(
-        route_analysis=route_analysis,
-        destination_order=cleaned,
-    ) if route_analysis is not None else []
+    warnings = (
+        validate_route_analysis_order(
+            route_analysis=route_analysis,
+            destination_order=cleaned,
+        )
+        if route_analysis is not None
+        else []
+    )
 
     full_required = minimum_days_required_for_route(
         destination_order=cleaned,
@@ -684,7 +683,6 @@ def find_feasible_destination_order(
             minimum_days_required_for_route(
                 destination_order=candidate,
                 meta=meta,
-                route_analysis=None,
             )
         )
 
@@ -766,20 +764,11 @@ def allocate_days_for_route(
         2. Distribute remaining days deterministically in route order.
         3. Never reduce a destination below its minimum.
         4. Never reorder destinations.
-        5. Never move days because of a heuristic "border buffer".
+        5. Never move days because of a heuristic border buffer.
 
-    The previous border-buffer redistribution was intentionally removed.
-
-    Why:
-
-    A calendar-day redistribution based solely on country changes is a
-    planning heuristic, not geographic truth. The RouteGeographyEngine
-    already provides factual route legs. The planner should consume those
-    facts rather than manufacture a "buffer night" policy here.
-
-    `travel_style` is retained in the public signature for compatibility
-    with the orchestrator and future allocation policies. It does not
-    override factual route constraints.
+    `travel_style` and `route_analysis` remain in the signature for
+    compatibility with the orchestrator and future policies. Neither is
+    allowed to override the deterministic stay allocation.
     """
 
     del travel_style
@@ -831,17 +820,6 @@ def allocate_days_for_route(
 
     warnings: list[str] = []
 
-    # Deterministic route-order distribution.
-    #
-    # Example:
-    #
-    # minimum = [2, 2, 2]
-    # total = 7
-    #
-    # result = [3, 2, 2]
-    #
-    # This guarantees exact duration while keeping allocation predictable.
-
     index = 0
 
     while remaining > 0:
@@ -853,7 +831,6 @@ def allocate_days_for_route(
         remaining -= 1
         index += 1
 
-    # Hard invariants.
     if len(allocation) != n:
         raise ValueError(
             "Destination allocation length does not match destination "
@@ -899,12 +876,20 @@ def day_record_from_route_leg(
     is_first_day: bool,
     is_last_day: bool,
     is_arrival_day: bool,
+    destination_id: str,
     leg: RouteLeg | None,
     activity_count: int,
     destination_type: str | None,
 ) -> dict[str, Any]:
     """
     Convert one destination-arrival route leg into a planning day record.
+
+    IMPORTANT CONTRACT:
+
+    Every day record contains `destination_id`.
+
+    `itinerary_v2.py` uses destination identity to verify that the
+    day-level route remains identical to the requested route.
 
     The route leg is attached only to the calendar day on which the
     traveler arrives at the new destination.
@@ -914,6 +899,12 @@ def day_record_from_route_leg(
 
     record: dict[str, Any] = {
         "day_number": day_number,
+
+        # AUTHORITATIVE DAY DESTINATION.
+        "destination_id": str(
+            destination_id
+        ),
+
         "arrival": is_first_day,
         "departure": is_last_day,
         "destination_type": destination_type,
@@ -971,6 +962,26 @@ def day_record_from_route_leg(
         None,
     )
 
+    # IMPORTANT:
+    #
+    # route_duration_available answers:
+    # "Do we know the route duration?"
+    #
+    # route_unavailable answers:
+    # "Did the geography engine explicitly mark this route as
+    # unavailable?"
+    #
+    # These are NOT equivalent.
+    #
+    # duration_minutes=None means UNKNOWN, not unavailable.
+    explicit_route_unavailable = bool(
+        getattr(
+            leg,
+            "route_unavailable",
+            False,
+        )
+    )
+
     record.update(
         {
             "transfer": True,
@@ -990,7 +1001,7 @@ def day_record_from_route_leg(
             ),
             "is_destination_transition": True,
             "route_duration_available": duration_available,
-            "route_unavailable": not duration_available,
+            "route_unavailable": explicit_route_unavailable,
             "requires_transit_day": requires_transit_day,
             "_route_leg": leg,
         }
@@ -1035,6 +1046,14 @@ def day_records_from_route_analysis(
     TRANSIT is therefore a property of an existing day.
 
     No eighth day is ever created.
+
+    IMPORTANT CONTRACT:
+
+    Every generated record contains `destination_id`, including
+    non-transition days.
+
+    This is required because itinerary_v2.py validates destination
+    sequence from the generated day records.
     """
 
     ordered = normalize_destination_order(
@@ -1175,6 +1194,7 @@ def day_records_from_route_analysis(
                     is_first_day=is_first_day,
                     is_last_day=is_last_day,
                     is_arrival_day=is_arrival_day,
+                    destination_id=destination_id,
                     leg=leg,
                     activity_count=(
                         activity_counts.get(
@@ -1196,7 +1216,6 @@ def day_records_from_route_analysis(
             f"{len(records)} != {total_days}"
         )
 
-    # Final calendar-day invariant.
     if (
         records[0]["day_number"] != 1
         or records[-1]["day_number"] != total_days
@@ -1204,6 +1223,28 @@ def day_records_from_route_analysis(
         raise ValueError(
             "Generated day records do not form a continuous calendar "
             f"sequence from 1 to {total_days}."
+        )
+
+    # Final destination-sequence invariant.
+    #
+    # This catches adapter corruption before itinerary_v2.py receives
+    # the records.
+    actual_destination_sequence = (
+        normalize_destination_order(
+            [
+                record.get(
+                    "destination_id"
+                )
+                for record in records
+            ]
+        )
+    )
+
+    if actual_destination_sequence != ordered:
+        raise ValueError(
+            "Generated day records changed destination order: "
+            f"expected={ordered} "
+            f"actual={actual_destination_sequence}"
         )
 
     return records
@@ -1407,9 +1448,6 @@ def activity_record_from_drawer(
         )
     )
 
-    # Preserve destination identity when the persisted Drawer exposes it.
-    # ScheduleRepairEngine can use this later to prevent cross-destination
-    # activity movement.
     drawer_destination_id = getattr(
         drawer,
         "destination_id",
