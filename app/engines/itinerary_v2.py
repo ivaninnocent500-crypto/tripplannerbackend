@@ -86,7 +86,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy.orm import Session
 
@@ -337,25 +337,6 @@ class ItineraryOrchestrator:
         # ==============================================================
         # HARD USER-INTENT INVARIANT
         # ==============================================================
-        #
-        # The previous orchestrator allowed:
-        #
-        # requested A -> B -> C -> D
-        #
-        # to become:
-        #
-        # final A -> B -> C
-        #
-        # merely because feasibility returned the largest feasible
-        # prefix.
-        #
-        # That is dangerous because the user did not ask for a different
-        # journey.
-        #
-        # We therefore fail explicitly when feasibility changes the
-        # selected route. The caller can then explain the problem or ask
-        # the traveler to reduce the route/duration.
-        # ==============================================================
 
         if feasible_destination_ids != requested_destination_ids:
             logger.error(
@@ -384,12 +365,6 @@ class ItineraryOrchestrator:
         # ==============================================================
         # 6. FINAL ROUTE GEOGRAPHY
         # ==============================================================
-
-        #
-        # Even when feasibility did not change the route, run the
-        # geography engine again so every downstream stage uses the
-        # authoritative final route analysis.
-        #
 
         route_analysis = self.route_geography_engine.analyze(
             cleaned_destination_ids,
@@ -466,8 +441,6 @@ class ItineraryOrchestrator:
         result.warnings.extend(
             allocation_warnings
         )
-
-        # Exact allocation invariants.
 
         if len(day_allocation) != len(
             cleaned_destination_ids
@@ -784,15 +757,6 @@ class ItineraryOrchestrator:
         # 22. POST-REPAIR ROUTE INTEGRITY
         # ==============================================================
 
-        #
-        # ScheduleRepairEngine is deliberately conservative, but this
-        # second guard is still necessary.
-        #
-        # If a repair accidentally moved a Drawer or changed the
-        # persisted shelf relationship incorrectly, we fail before
-        # returning the Cabinet.
-        #
-
         repaired_destination_order = (
             self._destination_order_from_cabinet(
                 cabinet
@@ -828,10 +792,6 @@ class ItineraryOrchestrator:
             )
         )
 
-        #
-        # Pass the COMPLETE deterministic warning chain to validation,
-        # not merely build_result.warnings.
-        #
         validation_input_warnings = list(
             result.warnings
         )
@@ -948,6 +908,20 @@ class ItineraryOrchestrator:
         *,
         stage: str,
     ) -> None:
+        """
+        Verify that day-level records preserve the exact requested
+        destination sequence.
+
+        Day records produced by pipeline_adapters are dictionaries, so
+        destination identity must be read from the mapping rather than
+        through getattr().
+
+        Non-consecutive repeated destinations remain valid:
+
+            A -> B -> A
+
+        Consecutive duplicates are collapsed only for route comparison.
+        """
 
         if len(day_records) != total_days:
             raise ItineraryGenerationError(
@@ -959,19 +933,30 @@ class ItineraryOrchestrator:
             destination_ids
         )
 
-        actual_destinations = []
+        actual_destinations: list[str] = []
 
         for record in day_records:
-            destination_id = getattr(
-                record,
-                "destination_id",
-                None,
-            )
 
-            if destination_id:
-                actual_destinations.append(
-                    destination_id
+            if isinstance(record, Mapping):
+                destination_id = record.get(
+                    "destination_id"
                 )
+            else:
+                destination_id = getattr(
+                    record,
+                    "destination_id",
+                    None,
+                )
+
+            if destination_id is not None:
+                destination_id = str(
+                    destination_id
+                ).strip()
+
+                if destination_id:
+                    actual_destinations.append(
+                        destination_id
+                    )
 
         actual_segments = normalize_destination_order(
             actual_destinations
