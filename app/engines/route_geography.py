@@ -1565,7 +1565,7 @@ def _leg_to_dict(
 def route_analysis_to_dict(
     analysis: RouteAnalysis,
 ) -> dict[str, Any]:
- """
+    """
     Convert RouteAnalysis into JSON-safe primitives.
 
     Suitable for:
