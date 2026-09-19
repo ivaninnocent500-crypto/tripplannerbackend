@@ -13,9 +13,42 @@ mid-engine leaves the transaction aborted and every subsequent query in
 the same request (including the route's own db.commit()) fails too,
 turning one soft "degraded" result into a hard 500.
 
-CHANGE LOG (this rewrite — consolidates patches 001/005/009/010 into
-one authoritative file; discard all of those, this file supersedes
-them)
+CHANGE LOG (this rewrite — adds trip-level map data to GET /{cabinet_id})
+--------------------------------------------------------------------
+5. MAP DATA ADDED TO GET /{cabinet_id} — the Android Map tab
+   (OSMMapScreen) previously had nothing to render from the API and
+   was hardcoded to a fixed Serengeti coordinate. get_trip() now
+   re-runs RouteGeographyEngine.analyze(cabinet.route_destination_ids)
+   — the same engine ItineraryOrchestrator already ran once during
+   generation — and returns its stops/legs as a new "map" field.
+
+   This is a deliberate re-run, not a persisted read, because
+   RouteAnalysis is never written to the Cabinet; it exists only
+   transiently inside ItineraryOrchestrator.generate() (see
+   app/engines/itinerary_v2.py). Re-running it here is cheap: it is
+   DB reads (travel_places, physical_geography, flights,
+   border_crossings) plus haversine math, no external calls, no LLM.
+
+   Chosen as an inline field on GET /{cabinet_id} rather than a
+   separate GET /{cabinet_id}/map endpoint, matching how "days" and
+   "why_itinerary" already work on this same route — one call, no
+   extra round trip for a screen that already fetches the trip.
+
+   Not added to generate_trip()'s response: the orchestrator already
+   computed and discarded a RouteAnalysis during generation, and the
+   app calls getTrip() fresh after generation completes (matching the
+   existing pattern where generate_trip() also omits "route",
+   "estimated_budget", and "dates" — those are getTrip()-only too).
+
+   allow_coordinate_estimate is left at its default (False) here: the
+   map should show real measured/flight-table facts or an honest gap,
+   never a haversine-derived "road" that could visually mislead a
+   traveler about how they'll actually get from A to B. If a future
+   product decision wants estimated legs plotted (dashed line, clearly
+   labelled), that is a one-line change to the analyze() call below —
+   not something to guess at silently.
+
+CHANGE LOG (previous rewrite — consolidates patches 001/005/009/010)
 --------------------------------------------------------------------
 1. NATIONALITY KEY MISMATCH FIXED — the previous version of this file
    read `request["nationality"]`, but GenerateTripV2RequestDto (the
@@ -107,6 +140,7 @@ from app.engines.operator_match_v2 import OperatorMatchEngine
 from app.engines.quote_engine import QuoteEngine
 from app.engines.booking_engine import BookingEngine
 from app.engines.visa_engine import VisaIntelligenceEngine
+from app.engines.route_geography import RouteAnalysis, RouteGeographyEngine
 
 # Attach to uvicorn's active handler so messages stream to Render stdout
 logger = logging.getLogger("uvicorn.error")
@@ -132,6 +166,88 @@ def _operator_summary(db: Session, tour_operator_id) -> dict:
     if not row:
         return {"name": None, "years_in_operation": None, "headquarters_country": None, "verification_status": None}
     return {"name": row[0], "years_in_operation": row[1], "headquarters_country": row[2], "verification_status": row[3]}
+
+
+# ---------------------------------------------------------------------
+# MAP SERIALIZATION
+# ---------------------------------------------------------------------
+
+def _route_analysis_to_map_dict(analysis: RouteAnalysis) -> dict:
+    """
+    Trip-level map payload for the Android Map tab (OSMMapScreen).
+
+    Deliberately a narrower projection than
+    route_geography.route_analysis_to_dict(): that function's full
+    output includes `alternatives`, `raw`, per-leg `warnings`, and
+    engine/version metadata meant for generation logs and debugging,
+    none of which the map needs to render markers and polylines. This
+    keeps the response small and keeps the map's contract (stops +
+    legs, nothing else) stable even if route_analysis_to_dict()'s
+    debug shape changes later.
+
+    NO-FABRICATION RULE (inherited from RouteGeographyEngine): a leg
+    with unknown transport is serialized with mode="unknown",
+    distance_km=None, duration_minutes=None, route_available=False.
+    Android must render that as a plain geographic connection, never
+    as "duration unavailable" or a fabricated transport label — see
+    ItineraryTheme/CabinetDayScreen's existing handling of the same
+    rule for transit days.
+    """
+    stops = [
+        {
+            "destination_id": stop.destination_id,
+            "destination_slug": None, # resolved separately below
+            "destination_name": stop.name,
+            "latitude": stop.point.latitude,
+            "longitude": stop.point.longitude,
+            "stop_order": stop.index,
+            "resolved": stop.resolved,
+        }
+        for stop in analysis.stops
+    ]
+
+    legs = [
+        {
+            "from_destination_id": leg.from_destination_id,
+            "to_destination_id": leg.to_destination_id,
+            "sequence": leg.sequence,
+            "transport_mode": leg.mode if not leg.is_unavailable else None,
+            "duration_minutes": leg.duration_minutes,
+            "distance_km": leg.distance_km,
+            "estimated": leg.estimated,
+            "is_inter_country": leg.is_inter_country,
+            "requires_border_crossing": leg.requires_border_crossing,
+            "route_available": not leg.is_unavailable,
+        }
+        for leg in analysis.legs
+    ]
+
+    return {"stops": stops, "legs": legs}
+
+
+def _attach_destination_slugs(db: Session, map_dict: dict) -> dict:
+    """
+    RouteGeographyEngine resolves destination identity from
+    travel_places but does not carry `slug` (it wasn't part of that
+    engine's contract — see its _fetch_destinations query, which
+    selects name/country/destination_type/coordinates only). The
+    Android map screen keys its own place-detail lookups
+    (GET /api/places/{slug}/images) on slug the same way the Day-by-Day
+    screen's _day_to_dict() does, so slugs are resolved here with the
+    same one-query-per-stop pattern _day_to_dict() already uses for
+    the same reason — trip stop counts are small (capped by the same
+    21-day wizard limit that bounds shelf count).
+    """
+    for stop in map_dict["stops"]:
+        if not stop["destination_id"]:
+            continue
+        row = db.execute(
+            text("SELECT slug FROM travel_places WHERE id = :id"),
+            {"id": stop["destination_id"]},
+        ).fetchone()
+        if row:
+            stop["destination_slug"] = row.slug
+    return map_dict
 
 
 # ---------------------------------------------------------------------
@@ -225,6 +341,25 @@ def get_trip(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(
     explanation_result = call_engine(
         "ExplanationEngine", lambda: ExplanationEngine().explain(cabinet), fallback={"facts": []}, db=db,
     )
+
+    # Map data: re-run RouteGeographyEngine over the persisted route.
+    # See _route_analysis_to_map_dict()'s docstring above for why this
+    # is a re-run rather than a persisted read, and why
+    # allow_coordinate_estimate is left False. Wrapped in call_engine
+    # like every other engine call in this file so a geography failure
+    # degrades to an empty map rather than failing the whole trip
+    # fetch — the Overview/Days tabs must keep working even if the Map
+    # tab can't.
+    map_result = call_engine(
+        "RouteGeographyEngine.analyze",
+        lambda: RouteGeographyEngine(db).analyze(
+            [str(x) for x in cabinet.route_destination_ids],
+            allow_coordinate_estimate=False,
+        ),
+        fallback=RouteAnalysis(), db=db,
+    )
+    map_dict = _attach_destination_slugs(db, _route_analysis_to_map_dict(map_result.value))
+
     return {
         "cabinet_id": str(cabinet.id),
         "title": cabinet.title,
@@ -237,6 +372,7 @@ def get_trip(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(
         "estimated_budget": {"low": cabinet.estimated_budget_low, "high": cabinet.estimated_budget_high},
         "days": [_day_to_dict(db, s) for s in cabinet.shelves],
         "why_itinerary": explanation_result.value["facts"],
+        "map": map_dict,
     }
 
 
@@ -390,45 +526,6 @@ def confirm_booking(wardrobe_id: str, db: Session = Depends(get_supabase_db), _=
 
 
 # ---------------------------------------------------------------------
-def _wardrobe_to_dict(db: Session, wardrobe: Wardrobe) -> dict:
-    """
-    Full payload for the "Your safari is ready" / "Booking confirmed"
-    screens — trip title, operator name, dates, travelers,
-    accommodation, transport, price, deposit, status.
-    """
-    cabinet = wardrobe.cabinet
-    operator_row = db.execute(
-        text("select name from tour_operators where id = :id"),
-        {"id": wardrobe.tour_operator_id},
-    ).fetchone()
-    operator_name = operator_row[0] if operator_row else None
-
-    first_shelf = cabinet.shelves[0] if cabinet.shelves else None
-    accommodation = None
-    transport = None
-    if first_shelf:
-        nights_total = sum(h.nights for s in cabinet.shelves for h in s.headboards)
-        tier = first_shelf.headboards[0].tier if first_shelf.headboards else None
-        accommodation = f"{(tier or 'Standard').title()} lodge · {nights_total} nights" if nights_total else None
-        transport = first_shelf.armrests[0].description.split(" · ")[0] if first_shelf.armrests else None
-
-    return {
-        "wardrobe_id": str(wardrobe.id),
-        "confirmation_code": wardrobe.confirmation_code,
-        "trip_title": cabinet.title,
-        "operator_name": operator_name,
-        "dates": {"start": cabinet.start_date, "end": cabinet.end_date},
-        "travelers": cabinet.travelers_adults + cabinet.travelers_children,
-        "accommodation": accommodation,
-        "transport": transport,
-        "price_per_person": float(wardrobe.price_per_person),
-        "total_price": float(wardrobe.total_price),
-        "deposit_amount": float(wardrobe.deposit_amount) if wardrobe.deposit_amount else None,
-        "status": wardrobe.status,
-    }
-
-
-# ---------------------------------------------------------------------
 def _day_to_dict(db: Session, shelf) -> dict:
     """
     RESTORED: destination_slug + destination_name, resolved from
@@ -466,4 +563,3 @@ def _day_to_dict(db: Session, shelf) -> dict:
         "transport": shelf.armrests[0].description if shelf.armrests else None,
         "meals": [t.meal_type for t in shelf.trays if t.included],
     }
-
