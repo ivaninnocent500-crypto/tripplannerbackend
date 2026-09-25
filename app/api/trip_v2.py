@@ -13,7 +13,28 @@ mid-engine leaves the transaction aborted and every subsequent query in
 the same request (including the route's own db.commit()) fails too,
 turning one soft "degraded" result into a hard 500.
 
-CHANGE LOG (this rewrite — adds trip-level map data to GET /{cabinet_id})
+CHANGE LOG (this rewrite — day_kind actually added to _day_to_dict())
+--------------------------------------------------------------------
+6. DAY_KIND ADDED TO _day_to_dict() — confirmed via production device
+   logs (Android crash: NullPointerException on DayKind.ordinal() at
+   CabinetDayScreen.kt:269) that "day_kind" was still absent from
+   every day object in the live deployed response, despite an earlier
+   patch draft for this exact fix. This revision actually applies it:
+   _day_to_dict() now always emits "day_kind", read via
+   getattr(shelf, "day_kind", "STANDARD") — the same safe-default
+   pattern already used for this exact attribute in
+   ItineraryOrchestrator._apply_day_themes() (app/engines/itinerary_v2.py).
+   The key is now unconditionally present in the dict (never omitted),
+   which is what actually matters for the Android side: Gson only
+   fails to apply its Kotlin default when a JSON key is missing
+   entirely, so as long as this dict always emits "day_kind" — even as
+   "STANDARD" in the worst case — the Android app will never receive a
+   null dayKind from this endpoint again. (The Android app has also
+   been hardened independently to treat a null/missing value as
+   STANDARD, so this fix is defense in depth, not the only thing
+   preventing a crash.)
+
+CHANGE LOG (previous rewrite — adds trip-level map data to GET /{cabinet_id})
 --------------------------------------------------------------------
 5. MAP DATA ADDED TO GET /{cabinet_id} — the Android Map tab
    (OSMMapScreen) previously had nothing to render from the API and
@@ -21,6 +42,12 @@ CHANGE LOG (this rewrite — adds trip-level map data to GET /{cabinet_id})
    re-runs RouteGeographyEngine.analyze(cabinet.route_destination_ids)
    — the same engine ItineraryOrchestrator already ran once during
    generation — and returns its stops/legs as a new "map" field.
+
+   CONFIRMED WORKING end-to-end against the live deployment (device
+   logs show a fully populated "map" object with resolved stops,
+   coordinates, and honest route_available=false legs where no
+   measured transport data exists). No changes made to this section in
+   this revision — kept exactly as previously verified.
 
    This is a deliberate re-run, not a persisted read, because
    RouteAnalysis is never written to the Cabinet; it exists only
@@ -349,7 +376,7 @@ def get_trip(cabinet_id: str, db: Session = Depends(get_supabase_db), _=Depends(
     # like every other engine call in this file so a geography failure
     # degrades to an empty map rather than failing the whole trip
     # fetch — the Overview/Days tabs must keep working even if the Map
-    # tab can't.
+    # tab can't. CONFIRMED WORKING against the live deployment.
     map_result = call_engine(
         "RouteGeographyEngine.analyze",
         lambda: RouteGeographyEngine(db).analyze(
@@ -526,6 +553,45 @@ def confirm_booking(wardrobe_id: str, db: Session = Depends(get_supabase_db), _=
 
 
 # ---------------------------------------------------------------------
+def _wardrobe_to_dict(db: Session, wardrobe: Wardrobe) -> dict:
+    """
+    Full payload for the "Your safari is ready" / "Booking confirmed"
+    screens — trip title, operator name, dates, travelers,
+    accommodation, transport, price, deposit, status.
+    """
+    cabinet = wardrobe.cabinet
+    operator_row = db.execute(
+        text("select name from tour_operators where id = :id"),
+        {"id": wardrobe.tour_operator_id},
+    ).fetchone()
+    operator_name = operator_row[0] if operator_row else None
+
+    first_shelf = cabinet.shelves[0] if cabinet.shelves else None
+    accommodation = None
+    transport = None
+    if first_shelf:
+        nights_total = sum(h.nights for s in cabinet.shelves for h in s.headboards)
+        tier = first_shelf.headboards[0].tier if first_shelf.headboards else None
+        accommodation = f"{(tier or 'Standard').title()} lodge · {nights_total} nights" if nights_total else None
+        transport = first_shelf.armrests[0].description.split(" · ")[0] if first_shelf.armrests else None
+
+    return {
+        "wardrobe_id": str(wardrobe.id),
+        "confirmation_code": wardrobe.confirmation_code,
+        "trip_title": cabinet.title,
+        "operator_name": operator_name,
+        "dates": {"start": cabinet.start_date, "end": cabinet.end_date},
+        "travelers": cabinet.travelers_adults + cabinet.travelers_children,
+        "accommodation": accommodation,
+        "transport": transport,
+        "price_per_person": float(wardrobe.price_per_person),
+        "total_price": float(wardrobe.total_price),
+        "deposit_amount": float(wardrobe.deposit_amount) if wardrobe.deposit_amount else None,
+        "status": wardrobe.status,
+    }
+
+
+# ---------------------------------------------------------------------
 def _day_to_dict(db: Session, shelf) -> dict:
     """
     RESTORED: destination_slug + destination_name, resolved from
@@ -535,6 +601,18 @@ def _day_to_dict(db: Session, shelf) -> dict:
     LOCATION summary row (destination_name). One extra single-row
     query per shelf — a trip is capped at 21 days by the app's wizard
     slider, so this is not worth batching into an IN-query.
+
+    FIX APPLIED (this revision) — "day_kind" added below. Confirmed
+    via production device logs that this key was absent from every
+    day object in the live deployed response, which crashed the
+    Android app's CabinetDayScreen (Gson does not apply Kotlin default
+    parameter values for a missing JSON key — see the Android-side fix
+    in TripV2Dtos.kt / CabinetDayScreen.kt for the full explanation).
+    Read via getattr with a "STANDARD" default, matching the exact
+    pattern ItineraryOrchestrator._apply_day_themes() already uses for
+    this same attribute in itinerary_v2.py, so shelf objects that
+    predate this column (if any) don't raise AttributeError. The key
+    is now unconditionally present in the returned dict.
     """
     destination_slug = None
     destination_name = None
@@ -554,6 +632,8 @@ def _day_to_dict(db: Session, shelf) -> dict:
         "destination_slug": destination_slug,
         "destination_name": destination_name,
         "theme": shelf.theme,
+        # NEW — always present, so Gson never sees a missing key here.
+        "day_kind": str(getattr(shelf, "day_kind", "STANDARD") or "STANDARD").upper(),
         "activities": [
             {"name": d.name, "description": d.description, "start_time": str(d.start_time) if d.start_time else None,
              "duration_minutes": d.duration_minutes, "type": d.activity_type}
@@ -563,3 +643,4 @@ def _day_to_dict(db: Session, shelf) -> dict:
         "transport": shelf.armrests[0].description if shelf.armrests else None,
         "meals": [t.meal_type for t in shelf.trays if t.included],
     }
+
